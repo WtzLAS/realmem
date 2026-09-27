@@ -1,0 +1,35 @@
+{
+  "name": "pi-realmem",
+  "version": "0.1.0",
+  "description": "Surprise-gated, on-demand long-term memory for Pi: global, project-shared (git) and project-personal facts in Markdown, indexed with SQLite FTS5 + sqlite-vec",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "memory", "sqlite", "embeddings"],
+  "engines": { "node": ">=22.13.0" },
+  "pi": {
+    "extensions": ["./extensions/realmem/index.ts"]
+  },
+  "files": ["src", "extensions", "README.md"],
+  "scripts": {
+    "test": "node --test --test-timeout=60000 tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "sqlite-vec": "^0.1.9",
+    "yaml": "^2.8.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
+    "@types/node": "^24.0.0",
+    "typebox": "*",
+    "typescript": "^5.9.0"
+  }
+}
