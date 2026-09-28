@@ -23,6 +23,16 @@ At the start of every task, before planning or editing:
    deploy commands, and when something fails unexpectedly.
 4. If a page says `More: page=2`, fetch it when the first page was all relevant.
 
+### Path notes
+
+When a tool result ends with `<realmem-path-notes>`, read it before continuing. It
+contains full memories, captions (read them with `realmem_recall(ids=[...])`), or a count
+of more notes (read them with `realmem_recall(paths=[...])`) for the files you just
+touched. Each note is shown once per session (again after a compaction). Notes are
+attached to exact files or directories, so touching a parent directory does not show
+them; use `realmem_recall(paths=[...])` to look up an area. `realmem_recall` also ranks memories about
+the paths you pass, or the ones you touched recently, first.
+
 ## 2. What to remember
 
 Remember facts that would cost a future session time or correctness to rediscover:
@@ -42,7 +52,14 @@ transient task status, things obvious from a quick look at the code, speculation
 - **caption**: a specific one-line title, e.g. `Run e2e tests with pnpm test:e2e (needs Docker)`.
 - **content**: self-contained Markdown; include exact commands, paths, versions,
   names and the *why*. Someone reading only this memory must be able to act on it.
-- **paths**: set when the fact only applies to part of the repo (e.g. `["packages/api"]`).
+- **paths**: set when the fact only applies to specific files: directories, files or
+  globs relative to the cwd (e.g. `["packages/api"]`, `["package.json"]`,
+  `["**/migrations/*.sql"]`), or `~/…` / absolute paths for global facts about files on
+  this machine (e.g. `["~/.config/nvim"]`). Path-scoped memories appear automatically, at
+  the end of a tool result inside `<realmem-path-notes>`, the first time you touch those
+  paths. Leave `paths` out and the fact covers the whole project (project scopes) or
+  everything (global). Paths are never guessed, so pass them whenever the fact is about
+  specific files.
 - **user_requested**: `true` only when the user explicitly asked you to remember it.
 
 ## 4. Scope

@@ -5,11 +5,12 @@
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { SelectItem } from "@earendil-works/pi-tui";
 import type { MemoryRow } from "../../src/db.ts";
-import type { Realmem } from "../../src/engine.ts";
+import { type Realmem, urgencyBasis } from "../../src/engine.ts";
 import { SCOPE_LABEL, type ScopeKind } from "../../src/files.ts";
 import { canonical, fmtTime, scopePaths } from "../../src/format.ts";
 import { idTimestamp } from "../../src/ids.ts";
 import { oneLine } from "../../src/text.ts";
+import { urgencyTier } from "../../src/judge.ts";
 import { FilterPicker, runWithLoader, showText } from "./ui.ts";
 
 const SHORT: Record<ScopeKind, string> = { global: "G", shared: "S", personal: "P" };
@@ -21,17 +22,26 @@ function memoryLines(engine: Realmem, m: MemoryRow): (theme: Theme) => string[] 
 		const meta: Array<[string, string]> = [
 			["id", `${m.id}  (${canonical(m.id)})`],
 			["scope", SCOPE_LABEL[m.kind]],
-			["paths", m.kind === "global" ? "—" : scopePaths(m) || "."],
+			["paths", scopePaths(m) || (m.kind === "global" ? "~ (user directory, default)" : ". (project root, default)")],
 			["used", `${u.used} (reinforced ${u.reinforce}, recalled ${u.recall}); last ${fmtTime(u.lastUsed)}`],
+			["shown", `${u.inject}× on path touch`],
 			["created", fmtTime(created)],
 			["updated", fmtTime(m.updated)],
 			["file", m.file],
 			["hash", m.hash.slice(0, 16)],
 			["vector", m.vecHash === m.hash ? "indexed" : "pending"],
 		];
+		if (scopePaths(m)) {
+			const g = engine.db.getUrgency(m.store, m.id);
+			const current = g && g.basis === urgencyBasis(m);
+			const tier = current ? urgencyTier(g.score, engine.settings.thresholds) : undefined;
+			meta.push(["urgency", g ? `${g.score.toFixed(2)}/2 → ${tier ?? "stale, re-judged soon"} (${g.source})${tier === "high" ? " · shown in full" : tier === "mid" ? " · caption" : tier === "low" ? " · counted" : ""}` : "not judged yet (caption)"]);
+		}
+		const ps = engine.db.getPathState(m.store, m.id);
+		if (ps) meta.push(["missing", `${ps.missing.join(", ")}${ps.suggestion ? ` → moved to ${ps.suggestion}? (press f)` : ""}`]);
 		if (m.flags) meta.push(["quarantine", m.flags]);
 		const out = [t.bold(m.caption), ""];
-		for (const [k, v] of meta) out.push(`${t.fg("muted", k.padEnd(10))} ${k === "quarantine" ? t.fg("warning", v) : v}`);
+		for (const [k, v] of meta) out.push(`${t.fg("muted", k.padEnd(10))} ${k === "quarantine" || k === "missing" ? t.fg("warning", v) : v}`);
 		out.push("", t.fg("borderMuted", "content"), "");
 		for (const l of m.content.split("\n")) out.push(l);
 		return out;
@@ -53,6 +63,7 @@ async function memoryPage(ctx: ExtensionCommandContext, engine: Realmem, initial
 			{ id: "edit" as const, key: "e", label: "edit content" },
 			{ id: "caption" as const, key: "c", label: "caption" },
 			{ id: "paths" as const, key: "p", label: "paths" },
+			...(engine.db.getPathState(m.store, m.id)?.suggestion ? [{ id: "fix" as const, key: "f", label: "apply suggested path" }] : []),
 			{ id: "move" as const, key: "m", label: "move scope" },
 			{ id: "delete" as const, key: "d", label: "delete" },
 			...(m.flags ? [{ id: "approve" as const, key: "a", label: "approve (unquarantine)" }] : []),
@@ -73,12 +84,25 @@ async function memoryPage(ctx: ExtensionCommandContext, engine: Realmem, initial
 					break;
 				}
 				case "paths": {
-					if (cur.kind === "global") {
-						ctx.ui.notify("global memories have no path scope", "info");
-						break;
+					const v = await ctx.ui.editor(
+						cur.kind === "global"
+							? "Path scopes, one per line: ~/… under the user directory or absolute paths; files, directories or globs ('~' = everywhere)"
+							: "Path scopes relative to the project root, one per line: files, directories or globs like **/*.sql ('.' = whole project)",
+						(cur.paths ?? [cur.kind === "global" ? "~" : "."]).join("\n"),
+					);
+					if (v !== undefined) {
+						m = await engine.updateMemory(ctx.cwd, cur, { paths: v.split(/\r?\n/).map((x) => x.trim()).filter(Boolean) });
+						engine.checkPaths(ctx.cwd);
 					}
-					const v = await ctx.ui.editor("Path scopes relative to the project root, one per line ('.' = whole project)", (cur.paths ?? ["."]).join("\n"));
-					if (v !== undefined) m = await engine.updateMemory(ctx.cwd, cur, { paths: v.split(/\r?\n/).map((x) => x.trim()).filter(Boolean) });
+					break;
+				}
+				case "fix": {
+					const ps = engine.db.getPathState(cur.store, cur.id);
+					if (ps?.suggestion && ps.missing.length === 1) {
+						const paths = (cur.paths ?? []).map((p) => (p === ps.missing[0] ? (ps.suggestion as string) : p));
+						m = await engine.updateMemory(ctx.cwd, cur, { paths });
+						engine.checkPaths(ctx.cwd);
+					}
 					break;
 				}
 				case "move": {
@@ -114,12 +138,16 @@ async function memoryPage(ctx: ExtensionCommandContext, engine: Realmem, initial
 	}
 }
 
-function listItems(rows: MemoryRow[]): SelectItem[] {
-	return rows.map((m) => ({
-		value: m.id,
-		label: `${m.flags ? "⚠" : SHORT[m.kind]} ${String(m.usedCount).padStart(3)}  ${oneLine(m.caption, 90)}`,
-		description: `${SCOPE_LABEL[m.kind]}${scopePaths(m) ? ` · ${scopePaths(m)}` : ""} · ${oneLine(m.content, 160)}`,
-	}));
+function listItems(rows: MemoryRow[], stale: Set<string>): SelectItem[] {
+	return rows.map((m) => {
+		const where = scopePaths(m);
+		const mark = m.flags ? "⚠" : stale.has(m.id) ? "✗" : SHORT[m.kind];
+		return {
+			value: m.id,
+			label: `${mark} ${String(m.usedCount).padStart(3)}  ${where ? `${oneLine(where, 28)} · ` : ""}${oneLine(m.caption, 90)}`,
+			description: `${SCOPE_LABEL[m.kind]}${where ? ` · ${where}` : ""}${stale.has(m.id) ? " · path missing" : ""} · ${oneLine(m.content, 160)}`,
+		};
+	});
 }
 
 export async function openManage(ctx: ExtensionCommandContext, engine: Realmem, initialQuery?: string): Promise<void> {
@@ -152,19 +180,19 @@ export async function openManage(ctx: ExtensionCommandContext, engine: Realmem, 
 			title = `realmem · search "${query}" · ${rows.length} results`;
 		} else {
 			const total = engine.db.count(storeIds, true);
-			rows = engine.db.list(storeIds, { limit: 5000, offset: 0, includeFlagged: true, order: "used" });
+			rows = engine.db.list(storeIds, { limit: 5000, offset: 0, includeFlagged: true, order: "path" });
 			const counts = sc.stores.map((s) => `${SCOPE_LABEL[s.kind]} ${engine.db.count([s.id], true)}`).join(" · ");
 			title = `realmem · ${total} memories (${counts})${sc.project ? ` · ${sc.project.name}` : ""}`;
 		}
 		const items: SelectItem[] = [
 			{ value: "__search", label: query ? "↺ clear search" : "🔎 semantic search…", description: "hybrid vector + keyword search (does not count as usage)" },
-			...listItems(rows),
+			...listItems(rows, engine.db.stalePathIds(storeIds)),
 		];
 		const picked = await ctx.ui.custom<string | undefined>(
 			(tui, theme, _kb, done) =>
 				new FilterPicker({
 					theme,
-					title: `${title}  —  G global · S shared · P personal · ⚠ quarantined · number = used`,
+					title: `${title}  —  by path, then used · G global · S shared · P personal · ⚠ quarantined · ✗ path missing`,
 					items,
 					selected: lastSelected,
 					maxVisible: Math.max(5, tui.terminal.rows - 8),

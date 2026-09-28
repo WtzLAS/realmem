@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { normalizeSettings } from "../src/config.ts";
-import { adoptPlainMarkdown, normalizePathScopes, parseMemoryMarkdown, pathScopeMatches, serializeMemory } from "../src/files.ts";
+import { adoptPlainMarkdown, normalizePathScopes, parseMemoryMarkdown, serializeMemory } from "../src/files.ts";
 import { idTimestamp, newId, parseId, toCanonicalUuid } from "../src/ids.ts";
 import { buildJudgeRequest, type Candidate, decide, NONE, type Neighbor, readSignals } from "../src/judge.ts";
 import type { MemoryRow } from "../src/db.ts";
@@ -47,9 +47,15 @@ test("files: markdown frontmatter round-trip and path scopes", () => {
 	assert.ok(!/used_count|importance/.test(text));
 	assert.deepEqual(normalizePathScopes(["./a/", "../x", "/abs", "b", "a"]), ["a", "b"]);
 	assert.deepEqual(normalizePathScopes(["a", "."]), ["."]);
-	assert.ok(pathScopeMatches(["packages/web"], "packages/web/src"));
-	assert.ok(pathScopeMatches(["packages/web"], "."));
-	assert.ok(!pathScopeMatches(["packages/web"], "packages/api"));
+	// Global memories: `~` by default, `~/…` under the user directory, absolute elsewhere.
+	assert.deepEqual(normalizePathScopes([".config/nvim", "~/", "/opt/tool"], "global"), ["~"]);
+	assert.deepEqual(normalizePathScopes([".config/nvim", "/opt/tool/", "~/src/../dev"], "global"), ["/opt/tool", "~/.config/nvim", "~/dev"]);
+	assert.deepEqual(normalizePathScopes(["~/x", "/abs"], "shared"), [], "project memories only take project-relative paths");
+	// Defaults on disk: "." for project memories, "~" for global ones.
+	const g = serializeMemory({ id, caption: "c", content: "x" }, "global");
+	assert.match(g, /\npaths:\n {2}- "~"\n/);
+	assert.deepEqual(parseMemoryMarkdown(g, "global").paths, ["~"]);
+	assert.match(serializeMemory({ id, caption: "c", content: "x" }, "personal"), /\npaths:\n {2}- \.\n/);
 	assert.throws(() => parseMemoryMarkdown("no frontmatter"));
 	const adopted = adoptPlainMarkdown("# Deploy\n\nUse make deploy");
 	assert.equal(adopted?.caption, "Deploy");
@@ -94,6 +100,7 @@ function row(id: string, caption: string, kind: MemoryRow["kind"] = "shared"): M
 		vecHash: null,
 		flags: null,
 		usedCount: 0,
+		injectCount: 0,
 		lastUsed: null,
 	};
 }

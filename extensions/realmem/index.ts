@@ -9,10 +9,12 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Realmem } from "../../src/engine.ts";
-import { formatStatus } from "../../src/format.ts";
+import { formatPathNotes, formatStatus } from "../../src/format.ts";
+import { displayPath, touchedPaths } from "../../src/paths.ts";
 import { buildSessionPrompt, SNAPSHOT_ENTRY, SNAPSHOT_VERSION, type SessionSnapshot } from "../../src/prompt.ts";
 import { sha256 } from "../../src/text.ts";
 import { openDebug } from "./debug-page.ts";
+import { PathNoteState } from "./path-notes.ts";
 import { openManage } from "./manage-page.ts";
 import { openSettings } from "./settings-page.ts";
 import { registerTools, rewriterFor } from "./tools.ts";
@@ -39,6 +41,7 @@ export default function realmem(pi: ExtensionAPI) {
 	let snapshot: SessionSnapshot | undefined;
 	let pendingImport: { files: Array<{ path: string; hash: string }>; results: string[] } | undefined;
 	let draining = false;
+	const notes = new PathNoteState();
 
 	const getEngine = (): Realmem => {
 		engine ??= new Realmem();
@@ -84,6 +87,8 @@ export default function realmem(pi: ExtensionAPI) {
 
 	registerTools(pi, {
 		engine: () => getEngine(),
+		recentPaths: () => notes.recentPaths(),
+		markSeen: (ids) => notes.markShown(ids),
 		afterRemember: (ctx, status) => {
 			pendingImport?.results.push(status);
 			refreshStatus(ctx);
@@ -95,10 +100,11 @@ export default function realmem(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		snapshot = undefined;
+		notes.reset(ctx.sessionManager.getBranch());
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === SNAPSHOT_ENTRY) {
 				const data = entry.data as SessionSnapshot | undefined;
-				if (data?.v === SNAPSHOT_VERSION && typeof data.prompt === "string") snapshot = data;
+				if (typeof data?.v === "number" && data.v >= 1 && typeof data.prompt === "string") snapshot = data; // older snapshots stay valid: never change a running session's prompt
 			}
 		}
 		let e: Realmem;
@@ -128,8 +134,18 @@ export default function realmem(pi: ExtensionAPI) {
 		if (!e.semifClient.configured && ctx.hasUI) {
 			ctx.ui.notify("realmem: no SemIf judge endpoint is set, so new memories are only queued. Configure it (and the embedding API) in /realmem settings.", "warning");
 		}
+		try {
+			e.resetRepoCache();
+			const paths = e.checkPaths(ctx.cwd);
+			if (paths.stale > 0 && ctx.hasUI) {
+				ctx.ui.notify(`realmem: ${paths.stale} memor${paths.stale === 1 ? "y refers" : "ies refer"} to paths that no longer exist; review with /realmem manage`, "warning");
+			}
+		} catch {
+			// git unavailable: skip
+		}
 		refreshStatus(ctx);
 		void e.embedInBackground().then(() => refreshStatus(ctx)).catch(() => {});
+		void e.refreshUrgencyInBackground(ctx.cwd);
 		drain(ctx);
 	});
 
@@ -154,16 +170,18 @@ export default function realmem(pi: ExtensionAPI) {
 			}
 			let top: ReturnType<Realmem["topMemories"]> = [];
 			let total = 0;
+			let pathMap: ReturnType<Realmem["pathMap"]> = [];
 			try {
 				top = e.topMemories(ctx.cwd, e.settings.prompt.topCaptions);
 				total = e.db.count(e.scopes(ctx.cwd).stores.map((s) => s.id));
+				if (e.settings.paths.inject) pathMap = e.pathMap(ctx.cwd, 10);
 			} catch {
 				// index unavailable: prompt without captions
 			}
 			const project = e.scopes(ctx.cwd).project;
 			snapshot = {
 				v: SNAPSHOT_VERSION,
-				prompt: buildSessionPrompt({ top, total, projectName: project?.name, stripped: strip }),
+				prompt: buildSessionPrompt({ top, total, projectName: project?.name, stripped: strip, pathMap }),
 				strip,
 				createdAt: new Date().toISOString(),
 			};
@@ -194,6 +212,51 @@ export default function realmem(pi: ExtensionAPI) {
 			);
 		}
 		refreshStatus(ctx);
+	});
+
+	// Path notes: memories attached to the paths a tool call touched, appended to its result.
+	pi.on("tool_result", (event, ctx) => {
+		if (!engine || event.toolName.startsWith("realmem_")) return;
+		const e = engine;
+		if (!e.settings.paths.inject) return;
+		const touched = touchedPaths(event.toolName, event.input, ctx.cwd);
+		if (touched.length === 0) return;
+		notes.touch(touched);
+		// Pick up memories pulled via git or edited by hand (cheap when nothing changed).
+		if (Date.now() - notes.lastSync > 5_000) {
+			notes.lastSync = Date.now();
+			try {
+				e.sync(ctx.cwd);
+			} catch {
+				// index busy: use what we have
+			}
+		}
+		const found = e.notesForPaths(ctx.cwd, touched, notes.shownIds);
+		const rendered = formatPathNotes(
+			touched.map((t) => displayPath(t, ctx.cwd)),
+			found,
+			e.settings.paths,
+		);
+		if (!rendered) return;
+		notes.markShown([...rendered.displayed, ...rendered.hinted]);
+		if (rendered.displayed.length > 0) e.db.bumpUsage(rendered.displayed, "inject");
+		return { content: [...event.content, { type: "text" as const, text: rendered.text }] };
+	});
+
+	// Persist the ids shown on this branch so a resumed or reloaded session does not repeat them.
+	pi.on("turn_end", () => {
+		const draft = notes.flush();
+		return draft ? { entries: [draft] } : undefined;
+	});
+
+	pi.on("session_tree", (_event, ctx) => {
+		notes.reset(ctx.sessionManager.getBranch());
+	});
+
+	// After a compaction the summarised tool results (and their path notes) are gone:
+	// notes shown before the first kept entry may be shown again.
+	pi.on("session_compact", (_event, ctx) => {
+		notes.reset(ctx.sessionManager.getBranch(), { keepUnflushed: true });
 	});
 
 	// Calls to other memory systems' tools are refused, even when they stay active.

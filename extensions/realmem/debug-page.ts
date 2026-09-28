@@ -44,6 +44,7 @@ function reportLines(o: RememberOutcome, showState: boolean): (t: Theme) => stri
 		out.push(`caption: ${o.candidate.caption}`);
 		if (o.candidate.paths) out.push(`paths: ${o.candidate.paths.join(", ")}`);
 		if (o.candidate.scopeHint) out.push(`scope hint: ${SCOPE_LABEL[o.candidate.scopeHint]}`);
+		out.push(`paths: ${o.candidate.paths ? o.candidate.paths.join(", ") : "(none: whole project root, or ~ for global)"}`);
 		for (const l of o.candidate.content.split("\n")) out.push(t.fg("muted", `  ${l}`));
 		const sf = o.safety;
 		out.push(
@@ -85,6 +86,7 @@ function reportLines(o: RememberOutcome, showState: boolean): (t: Theme) => stri
 
 		h("Decision");
 		if (o.decision) {
+			if (o.decision.paths) out.push(`paths: ${o.decision.paths.join(", ")}${o.decision.urgency !== undefined ? ` · urgency ${o.decision.urgency.toFixed(2)}/2` : ""}${o.decision.widen ? " · widens target" : ""}`);
 			out.push(`${t.bold(o.decision.action.toUpperCase())} → ${SCOPE_LABEL[o.decision.scope]}${o.decision.target ? ` · target ${o.decision.target.id} "${oneLine(o.decision.target.caption, 60)}"` : ""}`);
 			for (const r of o.decision.reasons) out.push(t.fg("muted", `  • ${r}`));
 		} else out.push(t.fg("muted", "none"));

@@ -12,7 +12,7 @@ import {
 	unlinkSync,
 	writeSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, normalize, posix, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, posix } from "node:path";
 import { parseDocument, stringify } from "yaml";
 import { newId, parseId, toCanonicalUuid } from "./ids.ts";
 import { textHash } from "./text.ts";
@@ -57,7 +57,7 @@ const FRONTMATTER_RE = /^\uFEFF?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$
 export class MemoryParseError extends Error {}
 
 /** Parse a memory markdown file. */
-export function parseMemoryMarkdown(text: string): MemoryFile {
+export function parseMemoryMarkdown(text: string, kind: ScopeKind = "shared"): MemoryFile {
 	const m = FRONTMATTER_RE.exec(text);
 	if (!m) throw new MemoryParseError("missing YAML frontmatter");
 	const doc = parseDocument(m[1], { uniqueKeys: false, prettyErrors: false });
@@ -78,7 +78,7 @@ export function parseMemoryMarkdown(text: string): MemoryFile {
 		id,
 		caption,
 		content,
-		paths: paths ? normalizePathScopes(paths) : undefined,
+		paths: paths ? normalizePathScopes(paths, kind) : undefined,
 		created: date(fm.created),
 		updated: date(fm.updated),
 	};
@@ -89,7 +89,8 @@ export function serializeMemory(mem: MemoryFile, kind: ScopeKind): string {
 		id: toCanonicalUuid(mem.id),
 		caption: mem.caption,
 	};
-	if (kind !== "global") fm.paths = mem.paths && mem.paths.length > 0 ? mem.paths : ["."];
+	// Unspecified paths default to the whole root: "." (project) or "~" (user directory, global).
+	fm.paths = mem.paths && mem.paths.length > 0 ? mem.paths : [kind === "global" ? "~" : "."];
 	if (mem.created) fm.created = mem.created;
 	if (mem.updated) fm.updated = mem.updated;
 	const yaml = stringify(fm, { lineWidth: 0 }).trimEnd();
@@ -97,30 +98,41 @@ export function serializeMemory(mem: MemoryFile, kind: ScopeKind): string {
 }
 
 /** Normalize project-relative path scopes. Invalid entries (absolute, escaping the root) are dropped. */
-export function normalizePathScopes(paths: string[]): string[] {
+export function normalizePathScopes(paths: string[], kind: ScopeKind = "shared"): string[] {
+	const global = kind === "global";
+	const whole = global ? "~" : ".";
 	const out = new Set<string>();
 	for (const raw of paths) {
 		if (typeof raw !== "string") continue;
 		let p = raw.trim().replace(/\\/g, "/");
 		if (!p) continue;
-		if (isAbsolute(p) || /^[A-Za-z]:\//.test(p)) continue;
+		if (global) {
+			// "~", "~/x" (under the user directory) or an absolute path elsewhere.
+			if (p === "." || p === "~" || p === "~/") {
+				out.add("~");
+				continue;
+			}
+			if (/^[A-Za-z]:\//.test(p)) p = p.replace(/^([A-Za-z]):/, "/$1");
+			if (p.startsWith("~/")) p = `~/${posix.normalize(p.slice(2))}`;
+			else if (isAbsolute(p)) p = posix.normalize(p);
+			else p = `~/${posix.normalize(p)}`;
+			p = p.replace(/\/+$/, "");
+			if (p === "~/." || p === "~") p = "~";
+			if (p.startsWith("~/../") || p === "~/.." || p === "") continue;
+			out.add(p);
+			continue;
+		}
+		if (isAbsolute(p) || /^[A-Za-z]:\//.test(p) || p.startsWith("~")) continue;
 		p = posix.normalize(p).replace(/\/+$/, "");
 		if (p === "" || p === "./") p = ".";
 		if (p === ".." || p.startsWith("../")) continue;
 		out.add(p);
 	}
-	if (out.has(".")) return ["."];
-	return [...out].sort();
-}
-
-/** Resolve a path scope argument given relative to `cwd` into one relative to `root`. */
-export function pathScopeFromCwd(root: string, cwd: string, p: string): string | undefined {
-	const abs = normalize(isAbsolute(p) ? p : join(canonicalPath(cwd), p));
-	let rel = relative(root, abs);
-	if (rel.startsWith("..") || isAbsolute(rel)) rel = relative(canonicalPath(root), canonicalPath(abs));
-	rel = rel.replace(/\\/g, "/");
-	if (rel.startsWith("..") || isAbsolute(rel)) return undefined;
-	return rel === "" ? "." : rel;
+	if (out.has(whole)) return [whole];
+	// Drop plain scopes already covered by another plain scope (`a` covers `a/b`).
+	const isGlob = (p: string) => /[*?[\]{}]/.test(p);
+	const plain = [...out].filter((p) => !isGlob(p));
+	return [...out].filter((p) => isGlob(p) || !plain.some((q) => q !== p && p.startsWith(`${q}/`))).sort((a, b) => a.localeCompare(b));
 }
 
 /** realpath of the longest existing prefix (so non-existing children still resolve through symlinks). */
@@ -137,15 +149,6 @@ export function canonicalPath(p: string): string {
 			head = parent;
 		}
 	}
-}
-
-/** Whether a memory's path scope applies to a project-relative location. */
-export function pathScopeMatches(paths: string[] | undefined, relCwd: string): boolean {
-	if (!paths || paths.length === 0) return true;
-	for (const p of paths) {
-		if (p === "." || relCwd === "." || relCwd === p || relCwd.startsWith(`${p}/`) || p.startsWith(`${relCwd}/`)) return true;
-	}
-	return false;
 }
 
 export function memoryFileName(id: string): string {
@@ -176,9 +179,9 @@ export function atomicWrite(file: string, data: string, mode = 0o644): void {
 	}
 }
 
-export function readMemoryFile(file: string): ParsedMemory {
+export function readMemoryFile(file: string, kind: ScopeKind = "shared"): ParsedMemory {
 	const text = readFileSync(file, "utf8");
-	const mem = parseMemoryMarkdown(text);
+	const mem = parseMemoryMarkdown(text, kind);
 	return { ...mem, file, hash: textHash(mem.caption, mem.content) };
 }
 

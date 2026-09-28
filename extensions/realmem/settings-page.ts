@@ -192,6 +192,69 @@ function fields(): FieldDef[] {
 		th("merge", "Merge threshold", "Minimum probability for a merge_with pick to count (→ Merge)."),
 		th("scopeMove", "Scope override threshold", "Scope probability at which a fact is added to its own scope instead of editing/merging a memory in another scope."),
 		th("recallMinSimilarity", "Recall min similarity", "Cosine similarity below which vector hits are ignored in recall."),
+		th("urgencyHigh", "Path urgency: full (0-2)", "Path urgency score at or above which a path-scoped memory is shown in full when the agent touches its paths.", 2),
+		th("urgencyMid", "Path urgency: caption (0-2)", "Path urgency score at or above which only the caption is shown; below it the memory is only counted.", 2),
+		{
+			id: "paths.inject",
+			label: "Show path notes on touch",
+			description: "Append memories attached to touched paths to the tool result (<realmem-path-notes>), once per session branch.",
+			get: (s) => (s.paths.inject ? "on" : "off"),
+			set: (s, v) => {
+				s.paths.inject = v === "on";
+			},
+			kind: "cycle",
+			values: ["on", "off"],
+		},
+		{
+			id: "paths.staleCheck",
+			label: "Flag missing paths",
+			description: "At session start, flag memories whose paths no longer exist (with rename suggestions from git).",
+			get: (s) => (s.paths.staleCheck ? "on" : "off"),
+			set: (s, v) => {
+				s.paths.staleCheck = v === "on";
+			},
+			kind: "cycle",
+			values: ["on", "off"],
+		},
+		{
+			id: "paths.maxFull",
+			label: "Path notes: max full",
+			description: "Max memories shown in full per tool result (others fall back to captions).",
+			get: (s) => String(s.paths.maxFull),
+			set: (s, v) => {
+				s.paths.maxFull = num(v);
+			},
+			kind: "number",
+			min: 0,
+			max: 20,
+			integer: true,
+		},
+		{
+			id: "paths.maxCaptions",
+			label: "Path notes: max captions",
+			description: "Max captions per tool result (others are only counted).",
+			get: (s) => String(s.paths.maxCaptions),
+			set: (s, v) => {
+				s.paths.maxCaptions = num(v);
+			},
+			kind: "number",
+			min: 0,
+			max: 50,
+			integer: true,
+		},
+		{
+			id: "paths.charBudget",
+			label: "Path notes: char budget",
+			description: "Character budget for full memory contents per tool result.",
+			get: (s) => String(s.paths.charBudget),
+			set: (s, v) => {
+				s.paths.charBudget = num(v);
+			},
+			kind: "number",
+			min: 500,
+			max: 100000,
+			integer: true,
+		},
 		{
 			id: "candidates.max",
 			label: "Max similar memories to judge",

@@ -7,8 +7,8 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { EmbeddingClient, type HttpTrace, SemIfClient, type SemIfResponse } from "./api.ts";
 import { agentDirFromEnv, embeddingFingerprint, loadSettings, type RealmemPaths, realmemPaths, type Settings, saveSettings, settingsMtime } from "./config.ts";
 import { LockTimeoutError, type MemoryRow, RealmemDB } from "./db.ts";
-import { MAX_CAPTION, MAX_CONTENT, type MemoryFile, normalizePathScopes, pathScopeFromCwd, SCOPE_LABEL, type ScopeKind, type StoreRef } from "./files.ts";
-import { newId } from "./ids.ts";
+import { MAX_CAPTION, MAX_CONTENT, type MemoryFile, normalizePathScopes, SCOPE_LABEL, type ScopeKind, type StoreRef } from "./files.ts";
+import { newId, parseId } from "./ids.ts";
 import {
 	buildJudgeRequest,
 	type Candidate,
@@ -17,21 +17,41 @@ import {
 	decide,
 	type JudgeRequest,
 	type Neighbor,
+	pathUrgencyQuestion,
 	readSignals,
 	type Signals,
+	type UrgencyTier,
+	urgencyTier,
 } from "./judge.ts";
 import { migratePersonalStore, type ProjectInfo, personalStore, type ScopeContext, scopeContext, writeProjectInfo } from "./project.ts";
 import { fallbackRewrite, type RewriteResult, type Rewriter } from "./rewrite.ts";
-import { describeSafety, redactSecrets, scanAll, scanInjection, stripInvisible } from "./safety.ts";
+import { describeSafety, redactSecrets, sanitizeForPrompt, scanAll, scanInjection, stripInvisible } from "./safety.ts";
 import { MemoryIndex, type RankedHit, type SyncReport } from "./store.ts";
 import { textHash } from "./text.ts";
+import {
+	absoluteScopes,
+	clearRepoCache,
+	coverSpecificity,
+	fromAbsoluteScope,
+	homeRoot,
+	isWholeScope,
+	pathsOverlap,
+	repoFiles,
+	resolvePathArg,
+	scopeCovers,
+	scopeExists,
+	suggestRename,
+} from "./paths.ts";
 
 export const WRITE_LOCK = "write";
 
 export interface RememberInput {
 	caption: string;
 	content: string;
-	/** Path scopes relative to the cwd (converted to project-root relative). */
+	/**
+	 * Path scopes: files, directories or globs, relative to the cwd, `~/…` or absolute.
+	 * Omitted = the whole root of the store (project root, or `~` for global memories).
+	 */
 	paths?: string[];
 	scope?: ScopeKind;
 	source: Candidate["source"];
@@ -83,6 +103,37 @@ export interface RecallResult {
 	page: number;
 	pages: number;
 	embedError?: string;
+	/** Project-relative paths the ranking favoured. */
+	focus?: string[];
+}
+
+/** Key under which a path urgency stays valid: the memory's content and its paths. */
+export function urgencyBasis(m: Pick<MemoryRow, "hash" | "paths">): string {
+	return `${m.hash}|${JSON.stringify(m.paths ?? null)}`;
+}
+
+/**
+ * Path rank of a memory for recall (focus = absolute paths): 2+ = its scope covers a
+ * focus path (the more specific, the higher), 1 = whole-root scope (project root or
+ * `~`), 0 = scoped to other paths only.
+ */
+export function pathTier(m: Pick<MemoryRow, "kind" | "paths">, focus: string[], projectRoot: string | undefined): number {
+	const abs = absoluteScopes(m, projectRoot);
+	if (!abs) return 1;
+	if (focus.length === 0) return 0.5;
+	const spec = coverSpecificity(abs, focus);
+	if (spec >= 0) return 2 + spec / 100;
+	// A focus directory that contains the memory's scope counts too (focus = packages/web, scope = packages/web/src).
+	if (abs.some((p) => focus.some((f) => scopeCovers(f, p)))) return 2;
+	return 0;
+}
+
+/** Convert absolute scopes into a store's frame, dropping those it cannot hold. */
+export function toStoreScopes(abs: string[] | undefined, kind: ScopeKind, projectRoot: string | undefined): string[] {
+	const whole = kind === "global" ? "~" : ".";
+	if (!abs || abs.length === 0) return [whole];
+	const out = abs.map((p) => fromAbsoluteScope(p, kind, projectRoot)).filter((p): p is string => !!p);
+	return normalizePathScopes(out.length > 0 ? out : [whole], kind);
 }
 
 export class CandidateError extends Error {}
@@ -100,6 +151,7 @@ export class Realmem {
 	private semif: SemIfClient;
 	private settingsMtime = 0;
 	private embedPromise: Promise<unknown> | undefined;
+	private urgencyPromise: Promise<unknown> | undefined;
 	private migrated = new Set<string>();
 
 	constructor(baseDir?: string) {
@@ -206,13 +258,29 @@ export class Realmem {
 	async recall(
 		cwd: string,
 		queries: string[],
-		opts: { page?: number; pageSize?: number; scope?: ScopeKind; signal?: AbortSignal; countUsage?: boolean } = {},
+		opts: {
+			page?: number;
+			pageSize?: number;
+			scope?: ScopeKind;
+			signal?: AbortSignal;
+			countUsage?: boolean;
+			/** Paths (relative to cwd, `~/…` or absolute) the query is about: ranked first; alone, lists their memories. */
+			paths?: string[];
+			/** Absolute paths the agent touched recently (ranked first as well). */
+			focus?: string[];
+		} = {},
 	): Promise<RecallResult> {
 		const ctx = this.scopes(cwd);
 		this.sync(cwd);
 		const stores = opts.scope ? ctx.stores.filter((s) => s.kind === opts.scope) : ctx.stores;
 		const texts = queries.map((q) => q.trim()).filter(Boolean).slice(0, 16);
-		if (texts.length === 0) throw new CandidateError("recall needs at least one non-empty query");
+		const explicit = (opts.paths ?? []).map((p) => resolvePathArg(p, cwd)).filter((p): p is string => !!p && p !== "/");
+		if (texts.length === 0) {
+			if (explicit.length === 0) throw new CandidateError("recall needs at least one non-empty query or a path");
+			return this.pathLookup(ctx, stores, explicit, opts);
+		}
+		const here = resolvePathArg(".", cwd);
+		const focus = [...new Set([...explicit, ...(opts.focus ?? []), ...(here && here !== ctx.project?.root && here !== homeRoot() ? [here] : [])])];
 		let vectors: Float32Array[] = [];
 		let embedError: string | undefined;
 		if (this.embedder.configured) {
@@ -228,29 +296,186 @@ export class Realmem {
 			vectors,
 			texts,
 			limit: s.recall.maxResults,
-			relCwd: ctx.project?.relCwd,
 			minSimilarity: s.thresholds.recallMinSimilarity,
 		});
-		// Relevant set first, then most used first (ties by relevance).
+		// Relevant set first; then ordered by path (memories about the focus paths first,
+		// project-wide next, other areas last), then most used, then relevance.
 		const rank = new Map(hits.map((h, i) => [h.memory.rid, i]));
-		hits.sort((a, b) => b.memory.usedCount - a.memory.usedCount || (rank.get(a.memory.rid) ?? 0) - (rank.get(b.memory.rid) ?? 0));
+		const tier = (m: MemoryRow) => pathTier(m, focus, ctx.project?.root);
+		hits.sort(
+			(a, b) =>
+				tier(b.memory) - tier(a.memory) || b.memory.usedCount - a.memory.usedCount || (rank.get(a.memory.rid) ?? 0) - (rank.get(b.memory.rid) ?? 0),
+		);
 		const pageSize = Math.max(1, opts.pageSize ?? s.recall.pageSize);
 		const pages = Math.max(1, Math.ceil(hits.length / pageSize));
 		const page = Math.min(Math.max(1, opts.page ?? 1), pages);
 		const items = hits.slice((page - 1) * pageSize, page * pageSize).map((h) => ({ ...h, store: this.storeById(ctx, h.memory.store) }));
 		if (items.length > 0 && opts.countUsage !== false) this.db.bumpUsage(items.map((i) => i.memory.id), "recall");
-		return { items, total: hits.length, page, pages, embedError };
+		return { items, total: hits.length, page, pages, embedError, focus };
 	}
 
-	/** Most used memories visible from `cwd` (for the session prompt). */
+	/** Fetch memories by id (compact or canonical UUID, or a unique prefix of ≥ 6 chars). */
+	getMemories(cwd: string, ids: string[], countUsage = true): { found: MemoryRow[]; missing: string[] } {
+		const ctx = this.scopes(cwd);
+		this.sync(cwd);
+		const stores = ctx.stores.map((s) => s.id);
+		const found: MemoryRow[] = [];
+		const missing: string[] = [];
+		for (const raw of ids.slice(0, 32)) {
+			const id = parseId(raw);
+			let m = id ? this.db.getById(id, stores) : undefined;
+			if (!m && !id && raw.trim().length >= 6) {
+				const hits = this.db.getByIdPrefix(raw.trim(), stores);
+				if (hits.length === 1) m = hits[0];
+			}
+			if (m && !m.flags) found.push(m);
+			else missing.push(raw);
+		}
+		if (countUsage && found.length > 0) this.db.bumpUsage(found.map((m) => m.id), "recall");
+		return { found, missing };
+	}
+
+	/** Recall without a query: the memories attached to the given paths, most specific then most used first. */
+	private pathLookup(
+		ctx: ScopeContext,
+		stores: StoreRef[],
+		paths: string[],
+		opts: { page?: number; pageSize?: number; countUsage?: boolean },
+	): RecallResult {
+		const rows = this.db
+			.pathScoped(stores.map((s) => s.id))
+			.map((m) => {
+				const abs = absoluteScopes(m, ctx.project?.root) ?? [];
+				return { m, spec: Math.max(coverSpecificity(abs, paths), abs.some((p) => paths.some((q) => scopeCovers(q, p))) ? 0 : -1) };
+			})
+			.filter((x) => x.spec >= 0)
+			.sort((a, b) => b.spec - a.spec || b.m.usedCount - a.m.usedCount);
+		const pageSize = Math.max(1, opts.pageSize ?? this.settings.recall.pageSize);
+		const pages = Math.max(1, Math.ceil(rows.length / pageSize));
+		const page = Math.min(Math.max(1, opts.page ?? 1), pages);
+		const items = rows.slice((page - 1) * pageSize, page * pageSize).map((x) => ({ memory: x.m as MemoryRow, score: 0, store: this.storeById(ctx, x.m.store) }));
+		if (items.length > 0 && opts.countUsage !== false) this.db.bumpUsage(items.map((i) => i.memory.id), "recall");
+		return { items, total: rows.length, page, pages, focus: paths };
+	}
+
+	/**
+	 * Most used project-wide (or global) memories visible from `cwd`, for the session
+	 * prompt. Path-scoped memories are left out: they are shown when their paths are touched.
+	 */
 	topMemories(cwd: string, limit: number): MemoryRow[] {
 		const ctx = this.scopes(cwd);
-		const rows = this.db.list(
-			ctx.stores.map((s) => s.id),
-			{ limit: limit * 3, offset: 0, order: "used" },
-		);
-		const rel = ctx.project?.relCwd;
-		return rows.filter((r) => r.kind === "global" || rel === undefined || !r.paths || r.paths.some((p) => p === "." || rel === "." || rel.startsWith(p) || p.startsWith(rel))).slice(0, limit);
+		const out: MemoryRow[] = [];
+		for (let offset = 0; out.length < limit; offset += 200) {
+			const rows = this.db.list(
+				ctx.stores.map((s) => s.id),
+				{ limit: 200, offset, order: "used" },
+			);
+			for (const r of rows) if (isWholeScope(r.paths ?? undefined)) out.push(r);
+			if (rows.length < 200) break;
+		}
+		return out.slice(0, limit);
+	}
+
+	/** Where path-scoped memories live: scope → number of memories, most first. */
+	pathMap(cwd: string, limit = 10): Array<{ path: string; count: number }> {
+		const ctx = this.scopes(cwd);
+		const counts = new Map<string, number>();
+		for (const m of this.db.pathScoped(ctx.stores.map((s) => s.id))) for (const p of m.paths ?? []) counts.set(p, (counts.get(p) ?? 0) + 1);
+		// Project paths are relative to the project root; global ones start with `~/` or `/`.
+		return [...counts.entries()]
+			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+			.slice(0, limit)
+			.map(([path, count]) => ({ path, count }));
+	}
+
+	// -------------------------------------------------------------------------
+	// path notes (shown when the agent touches a memory's paths)
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Path-scoped memories (project or global) covering any of the touched absolute
+	 * paths, most specific first, then most used. Each carries its urgency tier.
+	 */
+	notesForPaths(cwd: string, touched: string[], exclude: Set<string>): Array<{ memory: MemoryRow; tier: UrgencyTier; specificity: number }> {
+		const ctx = this.scopes(cwd);
+		if (touched.length === 0) return [];
+		const t = this.settings.thresholds;
+		const out: Array<{ memory: MemoryRow; tier: UrgencyTier; specificity: number }> = [];
+		for (const m of this.db.pathScoped(ctx.stores.map((s) => s.id))) {
+			if (exclude.has(m.id)) continue;
+			const abs = absoluteScopes(m, ctx.project?.root);
+			if (!abs) continue;
+			const spec = coverSpecificity(abs, touched);
+			if (spec < 0) continue;
+			out.push({ memory: m, tier: urgencyTier(m.urgency, t), specificity: spec });
+		}
+		return out.sort((a, b) => b.specificity - a.specificity || b.memory.usedCount - a.memory.usedCount);
+	}
+
+	/** Judge path urgency for path-scoped memories that have none (or a stale one). */
+	async refreshUrgency(cwd: string, signal?: AbortSignal, max = 16): Promise<number> {
+		if (!this.semif.configured) return 0;
+		const ctx = this.scopes(cwd);
+		const stores = ctx.stores.map((s) => s.id);
+		let done = 0;
+		while (done < max) {
+			const batch = this.db.urgencyStale(stores, Math.min(4, max - done));
+			if (batch.length === 0) break;
+			for (const m of batch) {
+				const state = [
+					`## Memory of an AI coding agent, attached to ${m.kind === "global" ? "paths on the user's machine" : "project paths"}`,
+					`Paths: ${(m.paths ?? []).join(", ")}`,
+					`Caption: ${sanitizeForPrompt(m.caption)}`,
+					"Content:",
+					sanitizeForPrompt(m.content),
+				].join("\n");
+				const r = await this.semif.evaluate(state, { path_urgency: pathUrgencyQuestion() }, signal);
+				const a = r.response.answers.path_urgency;
+				if (a?.type === "score") this.db.setUrgency(m.store, m.id, a.score, "judge", urgencyBasis(m));
+				done++;
+			}
+		}
+		return done;
+	}
+
+	/** Background, deduplicated urgency refresh. */
+	refreshUrgencyInBackground(cwd: string): Promise<unknown> {
+		if (this.urgencyPromise) return this.urgencyPromise;
+		this.urgencyPromise = this.refreshUrgency(cwd)
+			.catch((err) => ({ error: err instanceof Error ? err.message : String(err) }))
+			.finally(() => {
+				this.urgencyPromise = undefined;
+			});
+		return this.urgencyPromise;
+	}
+
+	/** Flag path-scoped memories whose paths no longer exist (with a rename suggestion from git). */
+	checkPaths(cwd: string): { checked: number; stale: number } {
+		const ctx = this.scopes(cwd);
+		if (!this.settings.paths.staleCheck) return { checked: 0, stale: 0 };
+		const noGit = { head: "", files: undefined, renames: new Map<string, string>() };
+		const repo = ctx.project ? repoFiles(ctx.project.root, ctx.project.isGit) : noGit;
+		let stale = 0;
+		const rows = this.db.scopedPaths(ctx.stores.map((s) => s.id));
+		this.db.tx(() => {
+			for (const m of rows) {
+				// Project scopes are checked against the working tree (globs via git); global
+				// scopes against the file system (globs are not checked without an index).
+				const root = m.kind === "global" ? homeRoot() : ctx.project?.root;
+				if (!root) continue;
+				const rel = (p: string) => (m.kind === "global" ? (p.startsWith("~/") ? p.slice(2) : p) : p);
+				const missing = m.paths.filter((p) => !scopeExists(root, rel(p), m.kind === "global" ? noGit : repo));
+				const suggestion = m.kind !== "global" && missing.length === 1 ? suggestRename(missing[0], repo, root) : undefined;
+				this.db.setPathState(m.store, m.id, m.hash, missing, suggestion);
+				if (missing.length > 0) stale++;
+			}
+		});
+		return { checked: rows.length, stale };
+	}
+
+	/** Forget cached git listings (e.g. at session start). */
+	resetRepoCache(): void {
+		clearRepoCache();
 	}
 
 	// -------------------------------------------------------------------------
@@ -285,11 +510,14 @@ export class Realmem {
 			safety.redacted = true;
 			if (scanInjection(content).length > 0) throw new CandidateError("refused after redaction");
 		}
+		// Paths are resolved to absolute ones here; the chosen store stores them relative to
+		// its root. No paths = the whole root (project root, or `~` for global memories).
 		let paths: string[] | undefined;
-		if (input.paths && input.paths.length > 0 && project) {
-			const rel = input.paths.map((p) => pathScopeFromCwd(project.root, cwd, p)).filter((p): p is string => !!p);
-			paths = normalizePathScopes(rel);
-			if (paths.length === 0) paths = undefined;
+		if (input.paths && input.paths.length > 0) {
+			const abs = [...new Set(input.paths.map((p) => resolvePathArg(p, cwd)).filter((p): p is string => !!p && p !== "/"))];
+			const wholeRoots = new Set([homeRoot(), ...(project ? [project.root] : [])]);
+			// Naming a store root is the same as naming no path.
+			paths = abs.length > 0 && !abs.every((p) => wholeRoots.has(p)) ? abs.filter((p) => !wholeRoots.has(p)).sort() : undefined;
 		}
 		return { candidate: { caption, content, paths, scopeHint: input.scope, source: input.source, force: input.force }, safety };
 	}
@@ -324,7 +552,13 @@ export class Realmem {
 			vecHits: hits.filter((h) => h.vecRank !== undefined).length,
 			ftsHits: hits.filter((h) => h.ftsRank !== undefined).length,
 		};
-		return { neighbors: hits.map((h) => ({ memory: h.memory, score: h.score, vecScore: h.vecScore, ftsScore: h.ftsScore })), vec };
+		let neighbors = hits.map((h) => ({ memory: h.memory, score: h.score, vecScore: h.vecScore, ftsScore: h.ftsScore }));
+		if (c.paths && c.paths.length > 0) {
+			// Memories about overlapping paths first: only they can be edited or merged.
+			const overlaps = (m: MemoryRow) => pathsOverlap(c.paths, absoluteScopes(m, ctx.project?.root));
+			neighbors = neighbors.map((n) => ({ ...n, score: overlaps(n.memory) ? n.score : n.score * 0.8 })).sort((a, b) => b.score - a.score);
+		}
+		return { neighbors, vec };
 	}
 
 	/** Ask SemIf. Splits questions over several requests when needed. */
@@ -369,7 +603,7 @@ export class Realmem {
 				ctx.stores.map((s) => s.id),
 			);
 			if (exact) {
-				outcome.decision = decide({ candidate, neighbors: [], exact, scopes }, this.settings.thresholds);
+				outcome.decision = decide({ candidate, neighbors: [], exact, scopes, projectRoot: ctx.project?.root }, this.settings.thresholds);
 				return this.apply(outcome, ctx, opts);
 			}
 			try {
@@ -380,14 +614,14 @@ export class Realmem {
 				const req = buildJudgeRequest(
 					candidate,
 					neighbors,
-					{ projectName: ctx.project?.name, isGit: ctx.project?.isGit, relCwd: ctx.project?.relCwd, scopes },
+					{ projectName: ctx.project?.name, isGit: ctx.project?.isGit, relCwd: ctx.project?.relCwd, projectRoot: ctx.project?.root, scopes },
 					this.settings.candidates,
 				);
 				outcome.judgeRequest = req;
 				const { signals, responses } = await this.judge(req, trace, opts.signal);
 				outcome.signals = signals;
 				outcome.judgeResponses = responses;
-				outcome.decision = decide({ candidate, neighbors: req.included, signals, scopes }, this.settings.thresholds);
+				outcome.decision = decide({ candidate, neighbors: req.included, signals, scopes, projectRoot: ctx.project?.root }, this.settings.thresholds);
 			} catch (err) {
 				if (opts.signal?.aborted) throw err;
 				const msg = err instanceof Error ? err.message : String(err);
@@ -471,10 +705,22 @@ export class Realmem {
 					outcome.message = `would reinforce ${label(t)}`;
 					return outcome;
 				}
+				let widened = "";
+				if (d.widen && d.paths) {
+					// Same fact, more places: extend the memory's path scope instead of duplicating it.
+					const store = this.storeById(ctx, t.store);
+					if (store) {
+						const add = toStoreScopes(d.paths, t.kind, ctx.project?.root);
+						const paths = normalizePathScopes([...(t.paths ?? []), ...add], t.kind);
+						this.index.writeMemory(store, { id: t.id, caption: t.caption, content: t.content, paths, created: t.created ?? undefined, updated: now() }, t.file);
+						widened = `; paths now ${paths.join(", ")}`;
+						void this.refreshUrgencyInBackground(opts.cwd);
+					}
+				}
 				this.db.bumpUsage([t.id], "reinforce");
-				outcome.memory = this.db.getByRid(t.rid) ?? t;
+				outcome.memory = this.db.getById(t.id, [t.store]) ?? t;
 				outcome.status = "reinforced";
-				outcome.message = `already known: reinforced ${label(t)} (used ${outcome.memory.usedCount}×)`;
+				outcome.message = `already known: reinforced ${label(t)} (used ${outcome.memory.usedCount}×${widened})`;
 				return outcome;
 			}
 			case "edit":
@@ -492,7 +738,11 @@ export class Realmem {
 				}
 				const store = this.storeById(ctx, t.store);
 				if (!store) throw new Error(`store of ${t.id} is not visible from here`);
-				const paths = t.kind === "global" ? undefined : normalizePathScopes([...(t.paths ?? ["."]), ...(c.paths ?? [])]);
+				// Unscoped candidate = scope unknown: keep the target's scope; scoped candidate: union.
+				// Unscoped candidate = keep the target's scope; scoped candidate: union.
+				const whole = t.kind === "global" ? "~" : ".";
+				const extra = d.paths ? toStoreScopes(d.paths, t.kind, ctx.project?.root) : [];
+				const paths = normalizePathScopes([...(t.paths ?? [whole]), ...extra], t.kind);
 				const mem: MemoryFile = { id: t.id, caption: r.caption, content: r.content, paths, created: t.created ?? undefined, updated: now() };
 				const row = this.index.writeMemory(store, mem, t.file);
 				this.db.bumpUsage([row.id], "reinforce");
@@ -500,6 +750,7 @@ export class Realmem {
 				outcome.status = d.action === "edit" ? "edited" : "merged";
 				outcome.message = `${d.action === "edit" ? "updated" : "merged into"} ${label(outcome.memory)}`;
 				void this.embedInBackground();
+				if (!isWholeScope(outcome.memory.paths ?? undefined)) void this.refreshUrgencyInBackground(opts.cwd);
 				return outcome;
 			}
 			case "add": {
@@ -510,7 +761,7 @@ export class Realmem {
 					id: newId(),
 					caption: c.caption,
 					content: c.content,
-					paths: d.scope === "global" ? undefined : (c.paths ?? ["."]),
+					paths: toStoreScopes(d.paths, d.scope, ctx.project?.root),
 					created: iso,
 					updated: iso,
 				};
@@ -522,9 +773,13 @@ export class Realmem {
 				}
 				if (store.kind === "personal" && ctx.project) writeProjectInfo(store.dir, ctx.project);
 				const row = this.index.writeMemory(store, mem);
+				if (d.urgency !== undefined && !isWholeScope(row.paths ?? undefined)) {
+					this.db.setUrgency(row.store, row.id, d.urgency, "remember", urgencyBasis(row));
+				}
 				outcome.memory = row;
 				outcome.status = "added";
-				outcome.message = `remembered ${label(row)}`;
+				const where = !isWholeScope(row.paths ?? undefined) ? ` for ${row.paths?.join(", ")}` : "";
+				outcome.message = `remembered ${label(row)}${where}`;
 				void this.embedInBackground();
 				return outcome;
 			}
@@ -592,7 +847,7 @@ export class Realmem {
 				id: row.id,
 				caption,
 				content,
-				paths: row.kind === "global" ? undefined : normalizePathScopes(patch.paths ?? row.paths ?? ["."]),
+				paths: normalizePathScopes(patch.paths ?? row.paths ?? [row.kind === "global" ? "~" : "."], row.kind),
 				created: row.created ?? undefined,
 				updated: now(),
 			};
@@ -612,7 +867,8 @@ export class Realmem {
 				id: row.id,
 				caption: row.caption,
 				content: row.content,
-				paths: kind === "global" ? undefined : (row.paths ?? ["."]),
+				// Re-express the paths in the destination's frame (e.g. project-relative → `~/…`).
+				paths: toStoreScopes(absoluteScopes(row, ctx.project?.root), kind, ctx.project?.root),
 				created: row.created ?? undefined,
 				updated: now(),
 			};
@@ -642,9 +898,17 @@ export class Realmem {
 			memories: this.db.count([s.id]),
 			quarantined: this.db.countFlagged([s.id]),
 		}));
+		const projectStores = ctx.stores.map((s) => s.id);
+		const scoped = this.db.pathScoped(projectStores);
 		return {
 			project: ctx.project ? { name: ctx.project.name, root: ctx.project.root, key: ctx.project.key, relCwd: ctx.project.relCwd } : null,
 			stores: perStore,
+			paths: {
+				scoped: scoped.length,
+				unjudged: scoped.filter((m) => m.urgency === undefined).length,
+				stale: this.db.stalePathIds(projectStores).size,
+				inject: this.settings.paths.inject,
+			},
 			embeddings: { ...this.db.embeddingStats(fp), fingerprint: fp, sqliteVec: this.db.vecAvailable ? "loaded" : `unavailable (${this.db.vecError})` },
 			pending: this.db.countPending(),
 			config: {

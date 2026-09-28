@@ -10,7 +10,6 @@ import {
 	memoryFileName,
 	type MemoryFile,
 	type ParsedMemory,
-	pathScopeMatches,
 	readMemoryFile,
 	type ScopeKind,
 	serializeMemory,
@@ -124,7 +123,7 @@ export class MemoryIndex {
 			indexed.delete(entry.file);
 			if (cur && Math.abs(cur.mtime - entry.mtimeMs) < 1 && cur.size === entry.size) continue;
 			try {
-				changed.push({ entry, parsed: readMemoryFile(entry.file) });
+				changed.push({ entry, parsed: readMemoryFile(entry.file, store.kind) });
 			} catch (err) {
 				changed.push({ entry, error: err instanceof MemoryParseError || err instanceof Error ? err.message : String(err) });
 			}
@@ -159,7 +158,7 @@ export class MemoryIndex {
 						file: p.file,
 						caption: p.caption,
 						content: p.content,
-						paths: store.kind === "global" ? undefined : p.paths,
+						paths: p.paths,
 						hash: p.hash,
 						created: p.created,
 						updated: p.updated,
@@ -179,7 +178,7 @@ export class MemoryIndex {
 
 	/** Index one file right after writing it (without a full directory scan). */
 	indexFile(store: StoreRef, file: string): MemoryRow | undefined {
-		const p = readMemoryFile(file);
+		const p = readMemoryFile(file, store.kind);
 		const st = statSync(file);
 		this.db.tx(() => {
 			const rid = this.db.upsertMemoryLocked({
@@ -189,7 +188,7 @@ export class MemoryIndex {
 				file,
 				caption: p.caption,
 				content: p.content,
-				paths: store.kind === "global" ? undefined : p.paths,
+				paths: p.paths,
 				hash: p.hash,
 				created: p.created,
 				updated: p.updated,
@@ -259,7 +258,7 @@ export class MemoryIndex {
 	 */
 	hybrid(
 		stores: StoreRef[],
-		opts: { vectors: Float32Array[]; texts: string[]; limit: number; relCwd?: string; minSimilarity?: number; excludeRids?: Set<number> },
+		opts: { vectors: Float32Array[]; texts: string[]; limit: number; minSimilarity?: number; excludeRids?: Set<number> },
 	): RankedHit[] {
 		const storeIds = stores.map((s) => s.id);
 		const lists: Array<{ hits: SearchHit[]; kind: "vec" | "fts"; weight?: number }> = [];
@@ -277,7 +276,6 @@ export class MemoryIndex {
 			const memory = rows.get(rid);
 			if (!memory || memory.flags) continue;
 			if (opts.excludeRids?.has(rid)) continue;
-			if (opts.relCwd !== undefined && memory.kind !== "global" && !pathScopeMatches(memory.paths, opts.relCwd)) continue;
 			out.push({ memory, ...f });
 		}
 		out.sort((a, b) => b.score - a.score);

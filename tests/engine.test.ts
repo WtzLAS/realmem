@@ -202,11 +202,15 @@ test("remember → add, reinforce, edit, merge; files and recall", async () => {
 		assert.equal(r.items[0].memory.id, id1, "most used first");
 		const r2 = await e.recall(proj, ["colima"], { page: 1 });
 		assert.ok(r2.items.some((i) => i.memory.kind === "personal"));
-		// Path scope: from packages/api the web-only memory is hidden.
+		// Path scope ranks instead of filtering: from packages/api the web-only memory is still found, but last.
 		mkdirSync(join(proj, "packages", "api"), { recursive: true });
 		clearProjectCache();
-		const r3 = await e.recall(join(proj, "packages", "api"), ["colima docker"]);
-		assert.ok(!r3.items.some((i) => i.memory.kind === "personal"), "path-scoped memory hidden elsewhere");
+		const r3 = await e.recall(join(proj, "packages", "api"), ["colima docker build"]);
+		const idx = r3.items.findIndex((i) => i.memory.kind === "personal");
+		assert.ok(idx >= 0, "path-scoped memory still recalled elsewhere");
+		assert.equal(idx, r3.items.length - 1, "…ranked after project-wide memories");
+		const r3b = await e.recall(join(proj, "packages", "web"), ["colima docker build"]);
+		assert.equal(r3b.items[0].memory.kind, "personal", "ranked first inside its path");
 		// CJK
 		nextAnswers = undefined;
 		await e.remember({ caption: "前端构建命令", content: "前端部分使用 pnpm --filter web build 构建。", source: "agent", force: true }, { cwd: proj });

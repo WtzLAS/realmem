@@ -6,7 +6,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ScopeKind } from "./files.ts";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export interface MemoryRow {
 	rid: number;
@@ -25,8 +25,22 @@ export interface MemoryRow {
 	vecHash: string | null;
 	/** Non-empty when the memory is quarantined by the safety scanner. */
 	flags: string | null;
+	/** Explicit uses: reinforcements + recall hits. Sort key. */
 	usedCount: number;
+	/** Times shown automatically because the agent touched the memory's paths (not a sort key). */
+	injectCount: number;
 	lastUsed: number | null;
+}
+
+export interface UrgencyRow {
+	score: number;
+	source: string;
+	basis: string;
+}
+
+export interface PathStateRow {
+	missing: string[];
+	suggestion: string | null;
 }
 
 export interface UpsertMemory {
@@ -61,17 +75,22 @@ export interface SearchHit {
 
 type Row = Record<string, SQLInputValue>;
 
-export type ListOrder = "used" | "recent" | "caption";
+export type ListOrder = "used" | "recent" | "caption" | "path";
 
-const SELECT_MEM_SQL = "SELECT m.*, COALESCE(u.used_count, 0) AS used_count, u.last_used AS last_used FROM memories m LEFT JOIN usage u ON u.id = m.id";
+const SELECT_MEM_SQL =
+	"SELECT m.*, COALESCE(u.used_count, 0) AS used_count, COALESCE(u.path_inject_count, 0) AS path_inject_count, u.last_used AS last_used FROM memories m LEFT JOIN usage u ON u.id = m.id";
 const LIST_WHERE = "WHERE m.store IN (SELECT value FROM json_each(?)) AND (? = 1 OR m.flags IS NULL)";
 const LIST_SQL: Record<ListOrder, string> = {
 	used: `${SELECT_MEM_SQL} ${LIST_WHERE} ORDER BY used_count DESC, m.rid DESC LIMIT ? OFFSET ?`,
 	recent: `${SELECT_MEM_SQL} ${LIST_WHERE} ORDER BY COALESCE(m.updated, m.created) DESC, m.rid DESC LIMIT ? OFFSET ?`,
 	caption: `${SELECT_MEM_SQL} ${LIST_WHERE} ORDER BY m.caption COLLATE NOCASE ASC LIMIT ? OFFSET ?`,
+	// Project-wide memories first, then grouped by path scope; most used first inside a group.
+	path: `${SELECT_MEM_SQL} ${LIST_WHERE} ORDER BY CASE WHEN m.paths IS NULL OR m.paths IN ('["."]', '["~"]') THEN '' ELSE m.paths END ASC, used_count DESC, m.rid DESC LIMIT ? OFFSET ?`,
 };
 const BUMP_REINFORCE_SQL = `INSERT INTO usage(id, used_count, reinforce_count, last_used) VALUES (?, ?, ?, ?)
  ON CONFLICT(id) DO UPDATE SET used_count = used_count + excluded.used_count, reinforce_count = reinforce_count + excluded.reinforce_count, last_used = excluded.last_used`;
+const BUMP_INJECT_SQL = `INSERT INTO usage(id, path_inject_count, last_used) VALUES (?, ?, ?)
+ ON CONFLICT(id) DO UPDATE SET path_inject_count = path_inject_count + excluded.path_inject_count`;
 const BUMP_RECALL_SQL = `INSERT INTO usage(id, used_count, recall_count, last_used) VALUES (?, ?, ?, ?)
  ON CONFLICT(id) DO UPDATE SET used_count = used_count + excluded.used_count, recall_count = recall_count + excluded.recall_count, last_used = excluded.last_used`;
 
@@ -256,6 +275,30 @@ export class RealmemDB {
 				CREATE TABLE IF NOT EXISTS imported_context (hash TEXT PRIMARY KEY, path TEXT NOT NULL, imported_at INTEGER NOT NULL);
 				CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(caption, content, tokenize = 'unicode61 remove_diacritics 2');
 			`);
+			if (version < 2) {
+				const cols = (this.db.prepare("PRAGMA table_info(usage)").all() as Array<{ name: string }>).map((c) => c.name);
+				if (!cols.includes("path_inject_count")) this.db.exec("ALTER TABLE usage ADD COLUMN path_inject_count INTEGER NOT NULL DEFAULT 0");
+				this.db.exec(`
+					CREATE TABLE IF NOT EXISTS urgency (
+						store TEXT NOT NULL,
+						id TEXT NOT NULL,
+						score REAL NOT NULL,
+						source TEXT NOT NULL,
+						basis TEXT NOT NULL,
+						updated INTEGER NOT NULL,
+						PRIMARY KEY(store, id)
+					);
+					CREATE TABLE IF NOT EXISTS path_state (
+						store TEXT NOT NULL,
+						id TEXT NOT NULL,
+						basis TEXT NOT NULL,
+						missing TEXT NOT NULL,
+						suggestion TEXT,
+						checked INTEGER NOT NULL,
+						PRIMARY KEY(store, id)
+					);
+				`);
+			}
 			this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 		});
 	}
@@ -398,6 +441,7 @@ export class RealmemDB {
 			vecHash: (r.vec_hash as string | null) ?? null,
 			flags: (r.flags as string | null) ?? null,
 			usedCount: Number(r.used_count ?? 0),
+			injectCount: Number(r.path_inject_count ?? 0),
 			lastUsed: r.last_used === null || r.last_used === undefined ? null : Number(r.last_used),
 		};
 	}
@@ -459,6 +503,11 @@ export class RealmemDB {
 
 	/** Remove a memory row by rid. Must run inside `tx`. */
 	deleteRidLocked(rid: number): void {
+		const row = this.stmt("SELECT store, id FROM memories WHERE rid = ?").get(rid) as { store: string; id: string } | undefined;
+		if (row) {
+			this.stmt("DELETE FROM urgency WHERE store = ? AND id = ?").run(row.store, row.id);
+			this.stmt("DELETE FROM path_state WHERE store = ? AND id = ?").run(row.store, row.id);
+		}
 		this.stmt("DELETE FROM memories_fts WHERE rowid = ?").run(rid);
 		if (this.vecAvailable && this.vecDim()) this.stmt("DELETE FROM memories_vec WHERE rid = ?").run(BigInt(rid));
 		this.stmt("DELETE FROM memories WHERE rid = ?").run(rid);
@@ -590,13 +639,13 @@ export class RealmemDB {
 	// usage counters (local only, never written to memory files)
 	// -------------------------------------------------------------------------
 
-	bumpUsage(ids: string[], kind: "reinforce" | "recall", by = 1): void {
+	bumpUsage(ids: string[], kind: "reinforce" | "recall" | "inject", by = 1): void {
 		if (ids.length === 0) return;
 		const now = Date.now();
-		const sql = kind === "reinforce" ? BUMP_REINFORCE_SQL : BUMP_RECALL_SQL;
 		this.tx(() => {
 			for (const id of new Set(ids)) {
-				this.stmt(sql).run(id, by, by, now);
+				if (kind === "inject") this.stmt(BUMP_INJECT_SQL).run(id, by, now);
+				else this.stmt(kind === "reinforce" ? BUMP_REINFORCE_SQL : BUMP_RECALL_SQL).run(id, by, by, now);
 			}
 		});
 	}
@@ -607,14 +656,89 @@ export class RealmemDB {
 		).run(id, count, Date.now());
 	}
 
-	usageDetail(id: string): { used: number; reinforce: number; recall: number; lastUsed: number | null } {
-		const r = this.stmt("SELECT used_count, reinforce_count, recall_count, last_used FROM usage WHERE id = ?").get(id) as Row | undefined;
+	usageDetail(id: string): { used: number; reinforce: number; recall: number; inject: number; lastUsed: number | null } {
+		const r = this.stmt("SELECT used_count, reinforce_count, recall_count, path_inject_count, last_used FROM usage WHERE id = ?").get(id) as Row | undefined;
 		return {
 			used: Number(r?.used_count ?? 0),
 			reinforce: Number(r?.reinforce_count ?? 0),
 			recall: Number(r?.recall_count ?? 0),
+			inject: Number(r?.path_inject_count ?? 0),
 			lastUsed: r?.last_used === undefined || r?.last_used === null ? null : Number(r.last_used),
 		};
+	}
+
+	// -------------------------------------------------------------------------
+	// path urgency (SemIf score, local; keyed by the path basis it was judged for)
+	// -------------------------------------------------------------------------
+
+	getUrgency(store: string, id: string): UrgencyRow | undefined {
+		const r = this.stmt("SELECT score, source, basis FROM urgency WHERE store = ? AND id = ?").get(store, id) as Row | undefined;
+		return r ? { score: Number(r.score), source: String(r.source), basis: String(r.basis) } : undefined;
+	}
+
+	setUrgency(store: string, id: string, score: number, source: string, basis: string): void {
+		this.stmt(
+			"INSERT INTO urgency(store, id, score, source, basis, updated) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(store, id) DO UPDATE SET score = excluded.score, source = excluded.source, basis = excluded.basis, updated = excluded.updated",
+		).run(store, id, score, source, basis, Date.now());
+	}
+
+	/** Path-scoped memories whose urgency is missing or was judged for other content/paths. */
+	urgencyStale(stores: string[], limit: number): MemoryRow[] {
+		const rows = this.stmt(
+			`${SELECT_MEM_SQL} LEFT JOIN urgency g ON g.store = m.store AND g.id = m.id
+			 WHERE m.store IN (SELECT value FROM json_each(?)) AND m.flags IS NULL
+			 AND m.paths IS NOT NULL AND m.paths NOT IN ('["."]', '["~"]') AND (g.basis IS NULL OR g.basis != m.hash || '|' || m.paths)
+			 LIMIT ?`,
+		).all(JSON.stringify(stores), limit) as Row[];
+		return rows.map((r) => this.rowToMemory(r));
+	}
+
+	/** Path-scoped memories (scope other than the whole project) of `stores`, with their urgency. */
+	pathScoped(stores: string[]): Array<MemoryRow & { urgency: number | undefined }> {
+		const rows = this.stmt(
+			`SELECT m.*, COALESCE(u.used_count, 0) AS used_count, COALESCE(u.path_inject_count, 0) AS path_inject_count, u.last_used AS last_used, g.score AS urgency_score
+			 FROM memories m LEFT JOIN usage u ON u.id = m.id
+			 LEFT JOIN urgency g ON g.store = m.store AND g.id = m.id AND g.basis = m.hash || '|' || m.paths
+			 WHERE m.store IN (SELECT value FROM json_each(?)) AND m.flags IS NULL
+			 AND m.paths IS NOT NULL AND m.paths NOT IN ('["."]', '["~"]')`,
+		).all(JSON.stringify(stores)) as Row[];
+		return rows.map((r) => ({
+			...this.rowToMemory(r),
+			urgency: r.urgency_score === null || r.urgency_score === undefined ? undefined : Number(r.urgency_score),
+		}));
+	}
+
+	// -------------------------------------------------------------------------
+	// stale path scopes
+	// -------------------------------------------------------------------------
+
+	getPathState(store: string, id: string): PathStateRow | undefined {
+		const r = this.stmt("SELECT missing, suggestion FROM path_state WHERE store = ? AND id = ?").get(store, id) as Row | undefined;
+		if (!r) return undefined;
+		return { missing: parsePaths(r.missing) ?? [], suggestion: r.suggestion === null ? null : String(r.suggestion) };
+	}
+
+	setPathState(store: string, id: string, basis: string, missing: string[], suggestion: string | undefined): void {
+		if (missing.length === 0) {
+			this.stmt("DELETE FROM path_state WHERE store = ? AND id = ?").run(store, id);
+			return;
+		}
+		this.stmt(
+			"INSERT INTO path_state(store, id, basis, missing, suggestion, checked) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(store, id) DO UPDATE SET basis = excluded.basis, missing = excluded.missing, suggestion = excluded.suggestion, checked = excluded.checked",
+		).run(store, id, basis, JSON.stringify(missing), suggestion ?? null, Date.now());
+	}
+
+	stalePathIds(stores: string[]): Set<string> {
+		const rows = this.stmt("SELECT id FROM path_state WHERE store IN (SELECT value FROM json_each(?))").all(JSON.stringify(stores)) as Array<{ id: string }>;
+		return new Set(rows.map((r) => String(r.id)));
+	}
+
+	/** Path-scoped memories of `stores` (for stale checks), as (store, id, paths, hash). */
+	scopedPaths(stores: string[]): Array<{ store: string; id: string; kind: ScopeKind; paths: string[]; hash: string }> {
+		const rows = this.stmt(
+			`SELECT store, id, kind, paths, hash FROM memories WHERE store IN (SELECT value FROM json_each(?)) AND paths IS NOT NULL AND paths NOT IN ('["."]', '["~"]')`,
+		).all(JSON.stringify(stores)) as Row[];
+		return rows.map((r) => ({ store: String(r.store), id: String(r.id), kind: r.kind as ScopeKind, paths: parsePaths(r.paths) ?? [], hash: String(r.hash) }));
 	}
 
 	// -------------------------------------------------------------------------

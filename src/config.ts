@@ -47,6 +47,10 @@ export interface Settings {
 		scopeMove: number;
 		/** Minimum cosine similarity for a vector hit to count as relevant during recall. */
 		recallMinSimilarity: number;
+		/** Path urgency score (0 Low .. 2 High) at or above which a memory is shown in full on touch. */
+		urgencyHigh: number;
+		/** Path urgency score at or above which a memory's caption is shown on touch (below: counted only). */
+		urgencyMid: number;
 	};
 	candidates: {
 		/** Max similar memories sent to SemIf (1..254). */
@@ -63,6 +67,18 @@ export interface Settings {
 	};
 	list: {
 		pageSize: number;
+	};
+	paths: {
+		/** Show path-scoped memories when a tool call touches their paths. */
+		inject: boolean;
+		/** Max memories shown in full per tool result (the rest fall back to captions). */
+		maxFull: number;
+		/** Max captions per tool result (the rest are only counted). */
+		maxCaptions: number;
+		/** Character budget for full memory contents per tool result. */
+		charBudget: number;
+		/** Check path scopes against the working tree and flag missing ones. */
+		staleCheck: boolean;
 	};
 	prompt: {
 		/** Number of most-used captions injected into the session system prompt. */
@@ -107,6 +123,8 @@ export const DEFAULT_SETTINGS: Settings = {
 		merge: 0.5,
 		scopeMove: 0.7,
 		recallMinSimilarity: 0.35,
+		urgencyHigh: 1.5,
+		urgencyMid: 0.75,
 	},
 	candidates: {
 		max: 40,
@@ -119,6 +137,13 @@ export const DEFAULT_SETTINGS: Settings = {
 	},
 	list: {
 		pageSize: 50,
+	},
+	paths: {
+		inject: true,
+		maxFull: 3,
+		maxCaptions: 8,
+		charBudget: 6000,
+		staleCheck: true,
 	},
 	prompt: {
 		topCaptions: 20,
@@ -188,6 +213,11 @@ export function normalizeSettings(raw: unknown): Settings {
 		s.thresholds[k] = clamp(s.thresholds[k], 0, 1);
 	}
 	s.thresholds.minImportance = clamp(s.thresholds.minImportance, 0, 3);
+	s.thresholds.urgencyHigh = clamp(s.thresholds.urgencyHigh, 0, 2);
+	s.thresholds.urgencyMid = Math.min(clamp(s.thresholds.urgencyMid, 0, 2), s.thresholds.urgencyHigh);
+	s.paths.maxFull = Math.round(clamp(s.paths.maxFull, 0, 20));
+	s.paths.maxCaptions = Math.round(clamp(s.paths.maxCaptions, 0, 50));
+	s.paths.charBudget = Math.round(clamp(s.paths.charBudget, 500, 100_000));
 	s.candidates.max = Math.round(clamp(s.candidates.max, 1, 254));
 	s.candidates.stateTokenBudget = Math.round(clamp(s.candidates.stateTokenBudget, 500, 1_000_000));
 	s.candidates.perMemoryChars = Math.round(clamp(s.candidates.perMemoryChars, 80, 20_000));

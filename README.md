@@ -36,7 +36,11 @@ updated: 2026-09-27T12:00:00.000Z
 The frontmatter never holds volatile or local data (usage counts, importance, conflicts).
 All of that lives in `~/.pi/agent/realmem/realmem.sqlite`:
 
-- **usage** counters: incremented on Reinforce and on every recall hit.
+- **usage** counters: `used_count` (Reinforce + recall hits; recall and lists sort by
+  it) and `path_inject_count` (times shown automatically on a path touch; never used
+  for sorting).
+- **path urgency** per memory (SemIf score, valid for its current content and paths),
+  plus **missing-path** flags.
 - **embeddings** cache, keyed by `sha256(caption + content)` and the embedding-space
   fingerprint (endpoint + model + dimensions). Changing the embedding API clears it.
 - **index**: FTS5 BM25 over pre-tokenized text, plus a sqlite-vec `vec0` cosine index.
@@ -74,7 +78,10 @@ segmented identically.
    - `importance`: score over trivial … broken or harmful result;
    - `durable`: noul — is this a lasting fact rather than task status?
    - `unsafe`: noul — secret or manipulation;
-   - `scope`: Global / Project Shared / Project Personal.
+   - `scope`: Global / Project Shared / Project Personal;
+   - `path_urgency` (asked when the fact has specific paths): score over three levels:
+     *Low*, the fact can be read later after an agent touches the path; *Mid*, provide
+     the caption; *High*, show the full fact as soon as the path is touched.
 
    Questions are split across requests according to `--max-questions`.
 5. **Decision**. The judge's action is combined with the thresholded picks:
@@ -83,7 +90,12 @@ segmented identically.
    - Merge requires a confident `merge_with` target;
    - a fact whose scope differs from its target's store is added, not edited;
    - importance and durability gate Add and Merge; `user_requested` bypasses that gate;
-   - `unsafe` rejects the candidate.
+   - `unsafe` rejects the candidate;
+   - **disjoint paths are not a conflict**: an Edit or Merge whose target has
+     non-overlapping paths becomes an Add ("jest in packages/a" vs "vitest in
+     packages/b");
+   - an exact duplicate for a new path widens the old memory's `paths` instead of adding
+     a copy.
 6. **Edit / Merge**: the configured Pi model rewrites the target memory, keeping its
    UUID. The result is scanned again; if it fails, a deterministic fallback is used.
 7. The file is written atomically, then indexed and embedded in the background.
@@ -99,15 +111,63 @@ Writes run under a SQLite lease lock (`locks` table, heartbeat-renewed and TTL-e
 a dead holder is detected by pid) plus WAL with `busy_timeout`. Several Pi processes
 can therefore share the stores safely.
 
+## Path scopes and path notes
+
+`paths` in the frontmatter can hold files (`package.json`), directories (`db`) or globs
+(`**/migrations/*.sql`, `packages/*/package.json`). When `paths` is not given it
+defaults to the root of the store. Nothing is inferred.
+
+| Store | Paths are relative to | Default |
+|---|---|---|
+| project shared / personal | the project root | `.` (whole project) |
+| global | the user directory: `~/…`; absolute paths elsewhere | `~` (everywhere) |
+
+The agent passes paths relative to its cwd, as `~/…`, or as absolute paths, and realmem
+stores them in the store's frame. A path outside the project makes the fact global.
+Moving a memory between stores (manage page) re-expresses its paths.
+
+- **Shown on touch.** After every tool call, realmem works out which paths it
+  touched: path arguments of any tool, and words of `bash` commands that exist on disk.
+  Memories whose scope covers those paths are appended to the end of the tool result,
+  inside `<realmem-path-notes>`, most specific scope first, then most used. The path
+  urgency decides how much is shown:
+
+  | Urgency (score 0–2) | Shown as |
+  |---|---|
+  | High (≥ 1.5) | full content |
+  | Mid (≥ 0.75, or not judged yet) | caption with id |
+  | Low | only counted: "N more memories are attached…" |
+
+  Per-result limits (`maxFull`, `maxCaptions`, `charBudget`) demote overflow to
+  captions, then to the count. Every memory is shown **once per session branch**. The
+  shown ids are stored in `realmem-shown` session entries at each turn end, so reload,
+  resume and tree navigation behave correctly. After a compaction, notes shown before
+  the first kept entry may be shown again, because the summary no longer contains them.
+  Only the path itself, or a location under it, triggers a note. Touching a parent
+  directory (e.g. `ls src` for a note on `src/db`) does not. The system prompt is never
+  touched.
+- **Urgency** is judged when the memory is remembered. For hand-written or edited
+  memories it is judged in the background by SemIf, and it is re-judged whenever the
+  content or paths change.
+- **Recall ranks, never filters, by path**: memories covering the given or recently
+  touched paths come first, project-wide ones next, those about other areas last.
+- **Missing paths.** At session start, scopes that no longer exist are flagged (✗ in
+  `/realmem manage`), with a suggested new location taken from `git log` renames
+  (press `f` to apply it).
+- **Counters.** `used_count` (recall and reinforce) drives sorting. `path_inject_count`
+  records automatic displays and never affects ranking.
+
 ## Model integration
 
 - **System prompt**: a `<realmem>` section. It declares realmem as the only memory
   system (ignore MEMORY.md, Claude memory, surmem, and Magic Context's
   `ctx_memory` / `<project-memory>`), tells the model to recall before any work and to
-  remember proactively, and lists the captions of the most-used memories. The section
-  is computed on the first prompt and stored in the session (`realmem-snapshot`), so it
-  stays byte-identical for the whole session, including after reload or resume. This
-  preserves the prompt cache.
+  remember proactively, lists the captions of the most-used project-wide memories, and
+  lists the paths that have path notes (for example `db (4), infra/terraform (2)`).
+  Path-scoped memories are left out of the caption list, since they appear when their
+  paths are touched. The section is computed on the first prompt and stored in the
+  session (`realmem-snapshot`), so it stays byte-identical for the whole session,
+  including after reload or resume. This preserves the prompt cache.
 - **Context files**: AGENTS.md / CLAUDE.md are stripped from the prompt once imported
   (`/realmem import`), because realmem replaces them.
 - **Hidden tools**: other memory tools (`ctx_memory` by default) are deactivated, and
@@ -115,11 +175,16 @@ can therefore share the stores safely.
 - **Import**: `/realmem import` marks context files as imported only when the agent
   actually stored facts from them.
 - **Tools**:
-  - `realmem_recall(queries[], page?, scope?)`: hybrid search; results are ordered by
-    used_count and paginated.
-  - `realmem_remember(caption, content, scope?, paths?, user_requested?)`
+  - `realmem_recall(queries?, paths?, ids?, page?, scope?)`: hybrid search. Results are
+    ordered by path (memories about the given or recently touched paths first,
+    project-wide next, other areas last), then by used_count, then by relevance, and are
+    paginated. `paths` alone lists the memories attached to those paths; `ids` reads
+    memories that were shown as captions.
+  - `realmem_remember(caption, content, scope?, paths?, user_requested?)`: `paths` takes
+    files, directories or globs.
   - `realmem_status()`
-  - `realmem_list(page?, scope?)`: demoted, since its output is large.
+  - `realmem_list(page?, scope?)`: sorted by path, then used; demoted, since its output
+    is large.
 - **Skill**: `realmem` covers when and how to recall, remember, pick a scope and correct
   memories.
 

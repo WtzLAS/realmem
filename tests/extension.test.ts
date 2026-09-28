@@ -112,7 +112,7 @@ test("extension registers tools, skill, command; freezes the session prompt; str
 	const rec = await tools.get("realmem_recall").execute("2", { queries: ["how to run tests"] }, undefined, undefined, ctx);
 	assert.match(rec.content[0].text, /<memory id="[A-Za-z0-9_-]{22}" scope="project-shared" used="0">/);
 	const list = await tools.get("realmem_list").execute("3", {}, undefined, undefined, ctx);
-	assert.match(list.content[0].text, /\| shared \| 1 \| Run tests/);
+	assert.match(list.content[0].text, /\| shared \| \* \| 1 \| Run tests/);
 	const st = await tools.get("realmem_status").execute("4", {}, undefined, undefined, ctx);
 	assert.match(st.content[0].text, /project-shared: 1 memories/);
 
