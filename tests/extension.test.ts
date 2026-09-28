@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { normalizeSettings, saveSettings } from "../src/config.ts";
+import { clearProjectCache } from "../src/project.ts";
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -148,4 +149,71 @@ test("extension registers tools, skill, command; freezes the session prompt; str
 	assert.equal(entries.length, 1);
 	assert.match(statuses.realmem ?? "", /🧠 2/);
 	await emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+});
+
+test("warns when .pi/realmem is ignored by git; /realmem fix-gitignore applies the verified fix", async () => {
+	clearProjectCache();
+	const gproj = mkdtempSync(join(tmpdir(), "realmem-extgi-"));
+	execFileSync("git", ["init", "-q"], { cwd: gproj });
+	writeFileSync(join(gproj, ".gitignore"), "node_modules/\n.pi/\n");
+	try {
+		const { default: realmem } = await import("../extensions/realmem/index.ts");
+		const handlers = new Map<string, Array<(e: any, c: any) => any>>();
+		const tools = new Map<string, any>();
+		const commands = new Map<string, any>();
+		realmem({
+			on: (e: string, h: any) => handlers.set(e, [...(handlers.get(e) ?? []), h]),
+			registerTool: (t: any) => tools.set(t.name, t),
+			registerCommand: (n: string, c: any) => commands.set(n, c),
+			getActiveTools: () => [],
+			setActiveTools: () => {},
+			getAllTools: () => [],
+			appendEntry: () => {},
+		} as any);
+		const emit = async (e: string, ev: any, c: any) => {
+			let last: any;
+			for (const h of handlers.get(e) ?? []) last = await h(ev, c);
+			return last;
+		};
+		const notes: Array<[string, string]> = [];
+		let confirmed = 0;
+		const ctx: any = {
+			cwd: gproj,
+			hasUI: true,
+			mode: "print",
+			ui: { setStatus: () => {}, notify: (m: string, l: string) => notes.push([m, l]), confirm: async () => (++confirmed, true) },
+			sessionManager: { getBranch: () => [] },
+			modelRegistry: { find: () => undefined, complete: async () => ({}) },
+			model: undefined,
+		};
+		await emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+		const warn = notes.find(([m]) => m.includes("is ignored by git"));
+		assert.ok(warn, notes.map((n) => n[0]).join("\n"));
+		assert.equal(warn[1], "warning");
+		assert.match(warn[0], /\.gitignore:2: `\.pi\/`/);
+		assert.match(warn[0], /!\/\.pi\/realmem\/\*\*/);
+		assert.match(warn[0], /\/realmem fix-gitignore/);
+
+		// Status shows it too, and a shared remember says the memory will not be committed.
+		const st = await tools.get("realmem_status").execute("s", {}, undefined, undefined, ctx);
+		assert.match(st.content[0].text, /WARNING: The shared memory store \.pi\/realmem\/ is ignored by git/);
+		const r = await tools.get("realmem_remember").execute("r", { caption: "Build with make", content: "Run make all." }, undefined, undefined, ctx);
+		assert.match(r.content[0].text, /is ignored by git, so this memory will not be committed/);
+
+		// The command appends the fix after confirmation and re-checks.
+		notes.length = 0;
+		await commands.get("realmem").handler("fix-gitignore", ctx);
+		assert.equal(confirmed, 1);
+		assert.match(readFileSync(join(gproj, ".gitignore"), "utf8"), /\.pi\/\n\n# realmem: share project memories \(\.pi\/realmem\) through git\n!\/\.pi\/\n\/\.pi\/\*\n!\/\.pi\/realmem\/\n!\/\.pi\/realmem\/\*\*\n$/);
+		assert.ok(notes.some(([m, l]) => l === "info" && m.includes("no longer ignored")), notes.map((n) => n[0]).join("\n"));
+		const ls = execFileSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: gproj, encoding: "utf8" });
+		assert.match(ls, /^\.pi\/realmem\/.+\.md$/m, "the shared memory is now visible to git");
+		// Running it again reports nothing to do.
+		notes.length = 0;
+		await commands.get("realmem").handler("fix-gitignore", ctx);
+		assert.ok(notes.some(([m]) => m.includes("is not ignored by git")));
+		await emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+	} finally {
+		rmSync(gproj, { recursive: true, force: true });
+	}
 });

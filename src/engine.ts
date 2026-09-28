@@ -26,6 +26,7 @@ import {
 import { migratePersonalStore, type ProjectInfo, personalStore, type ScopeContext, scopeContext, writeProjectInfo } from "./project.ts";
 import { fallbackRewrite, type RewriteResult, type Rewriter } from "./rewrite.ts";
 import { describeSafety, redactSecrets, sanitizeForPrompt, scanAll, scanInjection, stripInvisible } from "./safety.ts";
+import { checkSharedIgnored, describeIgnoreProblem, type IgnoreProblem } from "./gitignore.ts";
 import { MemoryIndex, type RankedHit, type SyncReport } from "./store.ts";
 import { textHash } from "./text.ts";
 import {
@@ -476,6 +477,23 @@ export class Realmem {
 	/** Forget cached git listings (e.g. at session start). */
 	resetRepoCache(): void {
 		clearRepoCache();
+		this.ignoreCache.clear();
+	}
+
+	private ignoreCache = new Map<string, { at: number; problem: IgnoreProblem | undefined }>();
+
+	/** Is the project's shared store ignored by git? Cached for a minute per project root. */
+	sharedIgnored(root: string, fresh = false): IgnoreProblem | undefined {
+		const hit = this.ignoreCache.get(root);
+		if (!fresh && hit && Date.now() - hit.at < 60_000) return hit.problem;
+		let problem: IgnoreProblem | undefined;
+		try {
+			problem = checkSharedIgnored(root);
+		} catch {
+			problem = undefined;
+		}
+		this.ignoreCache.set(root, { at: Date.now(), problem });
+		return problem;
 	}
 
 	// -------------------------------------------------------------------------
@@ -780,6 +798,10 @@ export class Realmem {
 				outcome.status = "added";
 				const where = !isWholeScope(row.paths ?? undefined) ? ` for ${row.paths?.join(", ")}` : "";
 				outcome.message = `remembered ${label(row)}${where}`;
+				if (row.kind === "shared" && ctx.project) {
+					const ignored = this.sharedIgnored(ctx.project.root);
+					if (ignored) outcome.message += ` (warning: ${store.dir} is ignored by git, so this memory will not be committed; see /realmem fix-gitignore)`;
+				}
 				void this.embedInBackground();
 				return outcome;
 			}
@@ -902,6 +924,10 @@ export class Realmem {
 		const scoped = this.db.pathScoped(projectStores);
 		return {
 			project: ctx.project ? { name: ctx.project.name, root: ctx.project.root, key: ctx.project.key, relCwd: ctx.project.relCwd } : null,
+			gitignore: ctx.project?.isGit ? (() => {
+				const p = this.sharedIgnored(ctx.project.root);
+				return p ? describeIgnoreProblem(p) : null;
+			})() : null,
 			stores: perStore,
 			paths: {
 				scoped: scoped.length,

@@ -4,12 +4,14 @@
  * Registers the realmem tools, the /realmem command (manage, settings, debug,
  * import, status, …), a frozen per-session system prompt section, and a skill.
  */
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Realmem } from "../../src/engine.ts";
 import { formatPathNotes, formatStatus } from "../../src/format.ts";
+import { describeIgnoreProblem, SHARED_REL } from "../../src/gitignore.ts";
 import { displayPath, touchedPaths } from "../../src/paths.ts";
 import { buildSessionPrompt, SNAPSHOT_ENTRY, SNAPSHOT_VERSION, type SessionSnapshot } from "../../src/prompt.ts";
 import { sha256 } from "../../src/text.ts";
@@ -34,6 +36,7 @@ const SUBCOMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "embed", description: "embed memories that have no vector yet" },
 	{ name: "reindex", description: "clear the embedding cache and re-embed everything" },
 	{ name: "retry", description: "retry candidates queued while the judge was unreachable" },
+	{ name: "fix-gitignore", description: "check whether .pi/realmem is ignored by git and add the fix to .gitignore" },
 ];
 
 export default function realmem(pi: ExtensionAPI) {
@@ -136,6 +139,11 @@ export default function realmem(pi: ExtensionAPI) {
 		}
 		try {
 			e.resetRepoCache();
+			const project = e.scopes(ctx.cwd).project;
+			const ignored = project?.isGit ? e.sharedIgnored(project.root) : undefined;
+			if (ignored && ctx.hasUI) {
+				ctx.ui.notify(`realmem: ${describeIgnoreProblem(ignored)}\nOr run /realmem fix-gitignore to apply it.`, "warning");
+			}
 			const paths = e.checkPaths(ctx.cwd);
 			if (paths.stale > 0 && ctx.hasUI) {
 				ctx.ui.notify(`realmem: ${paths.stale} memor${paths.stale === 1 ? "y refers" : "ies refer"} to paths that no longer exist; review with /realmem manage`, "warning");
@@ -409,6 +417,9 @@ export default function realmem(pi: ExtensionAPI) {
 						else ctx.ui.notify(`realmem: processed ${r.value?.length ?? 0} queued candidate(s); ${e.db.countPending()} left`, "info");
 						break;
 					}
+					case "fix-gitignore":
+						await fixGitignore(ctx, e);
+						break;
 					default:
 						ctx.ui.notify(`realmem: unknown subcommand "${sub}". Try: ${SUBCOMMANDS.map((s) => s.name).join(", ")}`, "warning");
 				}
@@ -418,4 +429,33 @@ export default function realmem(pi: ExtensionAPI) {
 			refreshStatus(ctx);
 		},
 	});
+}
+
+/** Show the gitignore problem for the shared store and, after confirmation, append the verified fix. */
+async function fixGitignore(ctx: ExtensionCommandContext, e: Realmem): Promise<void> {
+	const project = e.scopes(ctx.cwd).project;
+	if (!project?.isGit) {
+		ctx.ui.notify("realmem: not in a git repository; nothing to fix", "info");
+		return;
+	}
+	const problem = e.sharedIgnored(project.root, true);
+	if (!problem) {
+		ctx.ui.notify(`realmem: ${SHARED_REL}/ is not ignored by git; project-shared memories will be committed`, "info");
+		return;
+	}
+	const text = describeIgnoreProblem(problem);
+	const fix = problem.fix;
+	if (!fix || !ctx.hasUI) {
+		ctx.ui.notify(`realmem: ${text}`, "warning");
+		return;
+	}
+	const target = isAbsolute(fix.file) ? fix.file : join(project.root, fix.file);
+	const ok = await ctx.ui.confirm(`Append to ${fix.file}?`, `${text}\n\nAppend the lines above to ${target}?`);
+	if (!ok) return;
+	const before = existsSync(target) ? readFileSync(target, "utf8") : "";
+	const block = `${before && !before.endsWith("\n") ? "\n" : ""}${before ? "\n" : ""}# realmem: share project memories (${SHARED_REL}) through git\n${fix.lines.join("\n")}\n`;
+	writeFileSync(target, before + block);
+	const after = e.sharedIgnored(project.root, true);
+	if (after) ctx.ui.notify(`realmem: ${fix.file} was updated, but ${SHARED_REL}/ is still ignored:\n${describeIgnoreProblem(after)}`, "error");
+	else ctx.ui.notify(`realmem: updated ${fix.file}; ${SHARED_REL}/ is no longer ignored. Commit ${fix.file} and ${SHARED_REL}/ to share memories.`, "info");
 }

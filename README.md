@@ -111,6 +111,30 @@ Writes run under a SQLite lease lock (`locks` table, heartbeat-renewed and TTL-e
 a dead holder is detected by pid) plus WAL with `busy_timeout`. Several Pi processes
 can therefore share the stores safely.
 
+## Sharing project memories through git
+
+Project-shared memories live in `.pi/realmem/` and are shared by committing them. If git
+ignores that directory, shared memories are silently never committed. This is common
+when `.pi/` is in `.gitignore`. realmem therefore runs `git check-ignore` on the store:
+
+- **At session start**, a warning names the rule that ignores it (file, line, pattern)
+  and gives the fix.
+- **`realmem_status`** repeats the warning, and a remember into the shared store notes
+  that the memory will not be committed.
+- **`/realmem fix-gitignore`** re-checks, asks for confirmation, and appends the fix.
+  Fixes are verified in a scratch copy of the repository's ignore rules before they are
+  suggested:
+
+  | Ignored by | Fix |
+  |---|---|
+  | `.pi/*`, `*.md`, `.pi/**` | `!/.pi/realmem/` and `!/.pi/realmem/**` in `.gitignore` |
+  | `.pi/` or `.pi` (the whole directory) | `!/.pi/`, `/.pi/*`, `!/.pi/realmem/`, `!/.pi/realmem/**` in `.gitignore`. Git cannot re-include a file inside an ignored directory, so `.pi` is re-included and everything else in it stays ignored |
+  | a nested `.pi/.gitignore` | the negation is added to that file |
+  | `.git/info/exclude` or the global excludes file | the negation goes into the committed `.gitignore` |
+
+  Check it yourself with `git check-ignore -v --no-index .pi/realmem/x.md`: no output
+  means the store is shared.
+
 ## Path scopes and path notes
 
 `paths` in the frontmatter can hold files (`package.json`), directories (`db`) or globs
@@ -199,6 +223,7 @@ Moving a memory between stores (manage page) re-expresses its paths.
 | `debug` | dry-run the full remember path and show the embedding, neighbours (cos / BM25 / RRF), raw SemIf answers and probabilities, the decision trace and the rewrite diff; `w` writes it for real |
 | `add` | remember a fact yourself |
 | `import` | the agent splits AGENTS.md / CLAUDE.md into facts |
+| `fix-gitignore` | check whether `.pi/realmem` is ignored by git and append the verified fix |
 | `status`, `embed`, `reindex`, `retry` | maintenance |
 
 API keys may be given as `$VAR` or `env:VAR` so they are not stored in `config.json`

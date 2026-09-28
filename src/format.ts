@@ -64,6 +64,7 @@ export function formatStatus(s: Record<string, unknown>): string {
 		project: { name: string; root: string; key: string; relCwd: string } | null;
 		stores: Array<{ scope: string; dir: string; memories: number; quarantined: number }>;
 		paths?: { scoped: number; unjudged: number; stale: number; inject: boolean };
+		gitignore?: string | null;
 		embeddings: { cached: number; stale: number; indexed: number; missing: number; fingerprint: string; sqliteVec: string };
 		pending: number;
 		config: { embedding: string | null; semif: string | null; rewriteModel: string | null };
@@ -72,6 +73,7 @@ export function formatStatus(s: Record<string, unknown>): string {
 	const lines: string[] = [];
 	lines.push(st.project ? `Project: ${st.project.name} (${st.project.root}, key ${st.project.key}, cwd ${st.project.relCwd})` : "Project: none (global memory only)");
 	for (const s2 of st.stores) lines.push(`- ${s2.scope}: ${s2.memories} memories${s2.quarantined ? `, ${s2.quarantined} quarantined` : ""} — ${s2.dir}`);
+	if (st.gitignore) lines.push(`WARNING: ${st.gitignore}`);
 	if (st.paths) {
 		const p = st.paths;
 		lines.push(
