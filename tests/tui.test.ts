@@ -99,7 +99,7 @@ before(async () => {
 		req.on("end", () => {
 			const body = data ? JSON.parse(data) : {};
 			res.setHeader("content-type", "application/json");
-			if (req.url === "/v1/models") return res.end(JSON.stringify({ data: [{ id: "m" }] }));
+			if (req.url === "/v1/models") return res.end(JSON.stringify({ data: [{ id: "m" }, { id: "semif-other" }] }));
 			if (req.url === "/v1/embeddings") {
 				const inputs: string[] = Array.isArray(body.input) ? body.input : [body.input];
 				return res.end(JSON.stringify({ data: inputs.map((t, index) => ({ index, embedding: [1, t.length % 5, 0.5, 0.1] })) }));
@@ -252,6 +252,34 @@ test("path urgency: debug page shows the judge's breakdown, manage page shows th
 		for (const s of ["path urgency", "1.70/2 → high (shown in full on path touch)", "judged when remembered", "High", "75.0%", "confidence 60.0%", "full ≥ 1.50"])
 			assert.ok(detail.includes(s), `manage detail shows ${s}`);
 		await e.deleteMemory(m);
+	} finally {
+		e.close();
+	}
+});
+
+test("settings page: SemIf model is picked from the server's /v1/models list", async () => {
+	const e = new Realmem(base);
+	try {
+		let picker = "";
+		const { ctx } = fakeCtx(
+			proj,
+			[
+				async (c, frame) => {
+					type(c, "SemIf model");
+					c.handleInput?.(KEY.enter); // open the remote picker
+					for (let i = 0; i < 50 && !frame().join("\n").includes("on the server"); i++) await new Promise((r) => setTimeout(r, 10));
+					picker = frame().join("\n");
+					type(c, "other");
+					c.handleInput?.(KEY.enter);
+					c.handleInput?.(KEY.esc);
+				},
+			],
+			{},
+		);
+		await openSettings(ctx, e);
+		for (const s of ["SemIf model · 2 models on the server", "semif-other", "(auto)", "type a name"]) assert.ok(picker.includes(s), `picker shows ${s}:\n${picker}`);
+		assert.equal(e.settings.semif.model, "semif-other");
+		assert.equal(JSON.parse(readFileSync(join(base, "config.json"), "utf8")).semif.model, "semif-other", "persisted");
 	} finally {
 		e.close();
 	}

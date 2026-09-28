@@ -100,7 +100,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	embedding: {
 		endpoint: "",
 		apiKey: "",
-		model: "Qwen/Qwen3-Embedding-8B",
+		model: "",
 		dimensions: 1024,
 		queryInstruction: "Given a question or keywords about a software project, retrieve memory notes that answer it",
 		timeoutMs: 60_000,
@@ -109,7 +109,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	semif: {
 		endpoint: "",
 		apiKey: "",
-		model: "semif-exl3-bridge",
+		model: "",
 		timeoutMs: 180_000,
 		maxQuestions: 16,
 	},
@@ -208,7 +208,7 @@ export function normalizeSettings(raw: unknown): Settings {
 	s.embedding.batchSize = Math.round(clamp(s.embedding.batchSize, 1, 2048));
 	s.embedding.timeoutMs = Math.round(clamp(s.embedding.timeoutMs, 1000, 600_000));
 	s.semif.timeoutMs = Math.round(clamp(s.semif.timeoutMs, 1000, 1_800_000));
-	s.semif.maxQuestions = Math.round(clamp(s.semif.maxQuestions, 1, 64));
+	s.semif.maxQuestions = Math.round(clamp(s.semif.maxQuestions, 1, 255));
 	for (const k of ["covered", "conflict", "merge", "scopeMove", "minDurable", "maxUnsafe", "recallMinSimilarity"] as const) {
 		s.thresholds[k] = clamp(s.thresholds[k], 0, 1);
 	}

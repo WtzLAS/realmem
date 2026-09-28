@@ -222,7 +222,7 @@ Moving a memory between stores (manage page) re-expresses its paths.
 | Subcommand | Does |
 |---|---|
 | `manage [query]` | browse all memories (filter or semantic search); view content and metadata, including path urgency; edit, re-scope, move, delete, approve quarantined ones |
-| `settings` | Edit/Merge model, embedding and SemIf endpoints, keys and models, thresholds, limits; built-in connectivity tests |
+| `settings` | Edit/Merge model, embedding and SemIf endpoints, keys and models (picked from the server's `/v1/models`), thresholds, limits; built-in connectivity tests |
 | `debug` | dry-run the full remember path and show the embedding, neighbours (cos / BM25 / RRF), raw SemIf answers and probabilities, the decision trace, the path urgency (tier, per-level probabilities, what the write would store; `p` sets candidate paths) and the rewrite diff; `w` writes it for real |
 | `add` | remember a fact yourself |
 | `import` | the agent splits AGENTS.md / CLAUDE.md into facts |
@@ -239,12 +239,15 @@ cd ~/Projects/realmem && npm install
 pi install ~/Projects/realmem        # or add the path to "packages" in ~/.pi/agent/settings.json
 ```
 
-realmem ships with no endpoints or API keys. Open `/realmem settings` and set:
+realmem ships with no endpoints, API keys or model names. Open `/realmem settings` and set:
 
 - the **SemIf endpoint** and key. Without it, new memories are only queued; they are
   processed once it is set;
 - the **embedding endpoint** and key. Without it, recall and deduplication use keyword
-  (BM25) search only.
+  (BM25) search only;
+- the **SemIf model** and **embedding model**: the picker fetches the server's
+  `/v1/models` list for you to choose from (or type a name). Left at `(auto)`, realmem
+  uses the server's only model; if the server lists several, calls fail until you pick one.
 
 Keys may be written as `$VAR` or `env:VAR` so they stay out of `config.json`. Then run
 `/realmem import` in each project that has an AGENTS.md or CLAUDE.md.

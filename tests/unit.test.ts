@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { test } from "node:test";
+import { EmbeddingClient, parseModelIds, SemIfClient } from "../src/api.ts";
 import { normalizeSettings } from "../src/config.ts";
 import { adoptPlainMarkdown, normalizePathScopes, parseMemoryMarkdown, serializeMemory } from "../src/files.ts";
 import { idTimestamp, newId, parseId, toCanonicalUuid } from "../src/ids.ts";
@@ -185,4 +187,60 @@ test("judge: decision matrix", () => {
 test("rewrite: parses fenced JSON", () => {
 	assert.deepEqual(parseRewrite('Sure:\n```json\n{"caption": "A", "content": "B"}\n```'), { caption: "A", content: "B" });
 	assert.throws(() => parseRewrite("no json"));
+});
+
+test("api: /v1/models parsing, default model is empty, questions cap 255", () => {
+	assert.deepEqual(parseModelIds({ object: "list", data: [{ id: "b" }, { id: "a" }, { id: "a" }] }), ["a", "b"]);
+	assert.deepEqual(parseModelIds({ models: [{ name: "x" }, "y", { model: "z" }, {}] }), ["x", "y", "z"]);
+	assert.deepEqual(parseModelIds(["m"]), ["m"]);
+	assert.deepEqual(parseModelIds({ error: "nope" }), []);
+	const d = normalizeSettings({});
+	assert.equal(d.embedding.model, "");
+	assert.equal(d.semif.model, "");
+	assert.equal(normalizeSettings({ semif: { maxQuestions: 999 } }).semif.maxQuestions, 255);
+	assert.equal(normalizeSettings({ semif: { maxQuestions: 200 } }).semif.maxQuestions, 200);
+});
+
+test("api: empty model uses the server's only model, several models is an error, a set model is sent as is", async () => {
+	let models: string[] = ["only-one"];
+	let listed = 0;
+	const sent: string[] = [];
+	const srv = createServer((req, res) => {
+		let data = "";
+		req.on("data", (c) => (data += c));
+		req.on("end", () => {
+			res.setHeader("content-type", "application/json");
+			if (req.url === "/v1/models") {
+				listed++;
+				return res.end(JSON.stringify({ data: models.map((id) => ({ id })) }));
+			}
+			const body = JSON.parse(data);
+			sent.push(body.model);
+			if (req.url === "/v1/embeddings") return res.end(JSON.stringify({ data: body.input.map((_: string, index: number) => ({ index, embedding: [1, 0] })) }));
+			res.end(JSON.stringify({ model: body.model, answers: { ok: { type: "noul", noul: 0.9 } } }));
+		});
+	});
+	await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+	const url = `http://127.0.0.1:${(srv.address() as { port: number }).port}/v1`;
+	try {
+		const s = normalizeSettings({ embedding: { endpoint: url, dimensions: 32 }, semif: { endpoint: url } });
+		const emb = new EmbeddingClient(s);
+		const sem = new SemIfClient(s);
+		assert.deepEqual(await emb.listModels(), ["only-one"]);
+		await emb.embed(["a"], "document");
+		await emb.embed(["b"], "document");
+		await sem.evaluate("state", { ok: { type: "noul", instructions: "?" } });
+		assert.deepEqual(sent, ["only-one", "only-one", "only-one"]);
+		assert.equal(listed, 3, "auto pick is asked once per client (plus the explicit listModels)");
+
+		models = ["a", "b"];
+		await assert.rejects(new SemIfClient(s).evaluate("state", { ok: { type: "noul", instructions: "?" } }), /lists 2 \(a, b\): pick one in \/realmem settings/);
+
+		const set = normalizeSettings({ semif: { endpoint: url, model: "chosen" } });
+		await new SemIfClient(set).evaluate("state", { ok: { type: "noul", instructions: "?" } });
+		assert.equal(sent.at(-1), "chosen");
+		assert.equal(listed, 4, "a configured model does not list models");
+	} finally {
+		srv.close();
+	}
 });

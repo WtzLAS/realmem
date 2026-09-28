@@ -116,6 +116,50 @@ export async function getJson<T>(url: string, apiKey: string, timeoutMs: number,
 	}
 }
 
+/**
+ * Model ids from a `/v1/models` response: OpenAI `{data: [{id}]}`, also `{models: [...]}`
+ * or a plain array, of objects (`id`, `name` or `model`) or strings. Sorted, deduplicated.
+ */
+export function parseModelIds(v: unknown): string[] {
+	const list = Array.isArray(v)
+		? v
+		: v && typeof v === "object"
+			? ((v as { data?: unknown }).data ?? (v as { models?: unknown }).models)
+			: undefined;
+	if (!Array.isArray(list)) return [];
+	const ids = list
+		.map((m) => (typeof m === "string" ? m : m && typeof m === "object" ? ((m as Record<string, unknown>).id ?? (m as Record<string, unknown>).name ?? (m as Record<string, unknown>).model) : undefined))
+		.filter((x): x is string => typeof x === "string" && x.trim() !== "")
+		.map((x) => x.trim());
+	return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * The model to send: the configured one, else the server's only model (asked once
+ * per client). An empty setting with several listed models is an error.
+ */
+async function resolveModel(
+	api: string,
+	configured: string,
+	cache: { model?: string },
+	list: (signal?: AbortSignal) => Promise<string[]>,
+	signal?: AbortSignal,
+): Promise<string> {
+	const set = configured.trim();
+	if (set) return set;
+	if (cache.model) return cache.model;
+	const ids = await list(signal);
+	if (ids.length === 1) {
+		cache.model = ids[0];
+		return ids[0];
+	}
+	throw new ApiError(
+		ids.length === 0
+			? `no ${api} model set and the server lists none (/realmem settings)`
+			: `no ${api} model set and the server lists ${ids.length} (${ids.slice(0, 4).join(", ")}${ids.length > 4 ? ", …" : ""}): pick one in /realmem settings`,
+	);
+}
+
 // ---------------------------------------------------------------------------
 // Embeddings (OpenAI-compatible, with the `instruction` extension)
 // ---------------------------------------------------------------------------
@@ -152,6 +196,8 @@ function l2normalize(v: Float32Array): Float32Array {
 
 export class EmbeddingClient {
 	private readonly settings: Settings;
+	/** Model picked automatically (the server's only one) when none is configured. */
+	private readonly auto: { model?: string } = {};
 
 	constructor(settings: Settings) {
 		this.settings = settings;
@@ -173,13 +219,14 @@ export class EmbeddingClient {
 		const cfg = this.settings.embedding;
 		if (!this.configured) throw new ApiError("embedding endpoint is not configured (/realmem settings)");
 		const key = resolveSecret(cfg.apiKey);
+		const model = await this.model(signal);
 		const vectors: Float32Array[] = [];
 		const traces: HttpTrace[] = [];
 		let tokens = 0;
 		for (let i = 0; i < texts.length; i += cfg.batchSize) {
 			const batch = texts.slice(i, i + cfg.batchSize).map((t) => (t.trim() ? t : "(empty)"));
 			const body: Record<string, unknown> = {
-				model: cfg.model,
+				model,
 				input: batch,
 				dimensions: cfg.dimensions,
 				encoding_format: "base64",
@@ -199,6 +246,17 @@ export class EmbeddingClient {
 
 	async health(signal?: AbortSignal): Promise<unknown> {
 		return getJson(`${this.base}/v1/models`, resolveSecret(this.settings.embedding.apiKey), 10_000, signal);
+	}
+
+	/** Model ids the embeddings server lists at /v1/models. */
+	async listModels(signal?: AbortSignal): Promise<string[]> {
+		if (!this.configured) throw new ApiError("embedding endpoint is not configured (/realmem settings)");
+		return parseModelIds(await this.health(signal));
+	}
+
+	/** The configured model, else the server's only one. */
+	model(signal?: AbortSignal): Promise<string> {
+		return resolveModel("embedding", this.settings.embedding.model, this.auto, (sg) => this.listModels(sg), signal);
 	}
 }
 
@@ -227,6 +285,8 @@ export interface SemIfResponse {
 
 export class SemIfClient {
 	private readonly settings: Settings;
+	/** Model picked automatically (the server's only one) when none is configured. */
+	private readonly auto: { model?: string } = {};
 
 	constructor(settings: Settings) {
 		this.settings = settings;
@@ -243,7 +303,7 @@ export class SemIfClient {
 	): Promise<{ response: SemIfResponse; trace: HttpTrace; request: unknown }> {
 		const cfg = this.settings.semif;
 		if (!this.configured) throw new ApiError("SemIf endpoint is not configured (/realmem settings)");
-		const request = { state, model: cfg.model, questions };
+		const request = { state, model: await this.model(signal), questions };
 		const { data, trace } = await postJson<SemIfResponse>(`${normalizeEndpoint(cfg.endpoint)}/v1/systemone`, resolveSecret(cfg.apiKey), request, {
 			timeoutMs: cfg.timeoutMs,
 			signal,
@@ -258,5 +318,16 @@ export class SemIfClient {
 
 	async health(signal?: AbortSignal): Promise<unknown> {
 		return getJson(`${normalizeEndpoint(this.settings.semif.endpoint)}/v1/models`, resolveSecret(this.settings.semif.apiKey), 10_000, signal);
+	}
+
+	/** Model ids the SemIf server lists at /v1/models. */
+	async listModels(signal?: AbortSignal): Promise<string[]> {
+		if (!this.configured) throw new ApiError("SemIf endpoint is not configured (/realmem settings)");
+		return parseModelIds(await this.health(signal));
+	}
+
+	/** The configured model, else the server's only one. */
+	model(signal?: AbortSignal): Promise<string> {
+		return resolveModel("SemIf", this.settings.semif.model, this.auto, (sg) => this.listModels(sg), signal);
 	}
 }

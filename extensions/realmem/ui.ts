@@ -375,3 +375,66 @@ export function padRight(s: string, width: number): string {
 	const w = visibleWidth(s);
 	return w >= width ? truncateToWidth(s, width) : s + " ".repeat(width - w);
 }
+
+/**
+ * Picks a model from a remote `/v1/models` list: shows a loader while `load` runs,
+ * then a filterable list (plus the `extra` entries, e.g. "auto" or "type a name…").
+ * Load errors are shown with the `extra` entries still selectable.
+ */
+export class RemotePicker implements Component {
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly title: string;
+	private readonly controller = new AbortController();
+	private readonly done: (value?: string) => void;
+	private picker: FilterPicker | undefined;
+	private status: string;
+	private closed = false;
+
+	constructor(opts: {
+		tui: TUI;
+		theme: Theme;
+		title: string;
+		load: (signal: AbortSignal) => Promise<SelectItem[]>;
+		extra: SelectItem[];
+		selected?: string;
+		done: (value?: string) => void;
+	}) {
+		this.tui = opts.tui;
+		this.theme = opts.theme;
+		this.title = opts.title;
+		this.done = (v) => {
+			if (this.closed) return;
+			this.closed = true;
+			this.controller.abort();
+			opts.done(v);
+		};
+		this.status = opts.theme.fg("muted", "fetching /v1/models…");
+		const show = (items: SelectItem[], title: string) => {
+			this.picker = new FilterPicker({ theme: this.theme, title, items, selected: opts.selected, maxVisible: Math.max(5, this.tui.terminal.rows - 10), done: this.done });
+		};
+		opts
+			.load(this.controller.signal)
+			.then((items) => show([...items, ...opts.extra], `${this.title} · ${items.length} model${items.length === 1 ? "" : "s"} on the server`))
+			.catch((err: unknown) => {
+				if (this.closed) return;
+				show(opts.extra, `${this.title} · could not list models: ${err instanceof Error ? err.message : String(err)}`);
+			})
+			.finally(() => this.tui.requestRender());
+	}
+
+	render(width: number): string[] {
+		if (this.picker) return this.picker.render(width);
+		const t = this.theme;
+		return [truncateToWidth(t.fg("accent", t.bold(this.title)), width), truncateToWidth(this.status, width), truncateToWidth(t.fg("dim", "esc cancel"), width)];
+	}
+
+	handleInput(data: string): void {
+		if (this.picker) return this.picker.handleInput(data);
+		if (matchesKey(data, Key.escape)) this.done();
+	}
+
+	invalidate(): void {
+		this.picker?.invalidate();
+	}
+}

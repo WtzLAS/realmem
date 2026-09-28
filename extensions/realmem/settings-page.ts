@@ -3,12 +3,15 @@
  */
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { type Component, type SelectItem, type SettingItem, SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, type SelectItem, type SettingItem, SettingsList, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import { EmbeddingClient, SemIfClient } from "../../src/api.ts";
 import { DEFAULT_SETTINGS, embeddingFingerprint, maskSecret, normalizeSettings, type Settings } from "../../src/config.ts";
 import type { Realmem } from "../../src/engine.ts";
-import { ActionSubmenu, FilterPicker, InputSubmenu } from "./ui.ts";
+import { ActionSubmenu, FilterPicker, InputSubmenu, RemotePicker } from "./ui.ts";
 
 const NOT_SET = "(not set)";
+const AUTO_MODEL = "(auto)";
+const TYPE_MODEL = "__type";
 
 type Getter = (s: Settings) => string;
 type Setter = (s: Settings, v: string) => void;
@@ -19,7 +22,9 @@ interface FieldDef {
 	description: string;
 	get: Getter;
 	set?: Setter;
-	kind: "text" | "secret" | "number" | "cycle" | "model" | "action";
+	kind: "text" | "secret" | "number" | "cycle" | "model" | "remote-model" | "action";
+	/** remote-model: list the server's models for the draft settings. */
+	listModels?: (draft: Settings, signal: AbortSignal) => Promise<string[]>;
 	values?: string[];
 	min?: number;
 	max?: number;
@@ -71,12 +76,13 @@ function fields(): FieldDef[] {
 		{
 			id: "embedding.model",
 			label: "Embedding model",
-			description: "Model name sent to the embeddings API. Changing it clears the embedding cache.",
-			get: (s) => s.embedding.model,
+			description: "Picked from the server's /v1/models list. (auto) = the server's only model. Changing it clears the embedding cache.",
+			get: (s) => s.embedding.model || AUTO_MODEL,
 			set: (s, v) => {
-				s.embedding.model = v;
+				s.embedding.model = v === AUTO_MODEL ? "" : v;
 			},
-			kind: "text",
+			kind: "remote-model",
+			listModels: (draft, signal) => new EmbeddingClient(draft).listModels(signal),
 		},
 		{
 			id: "embedding.dimensions",
@@ -133,24 +139,25 @@ function fields(): FieldDef[] {
 		{
 			id: "semif.model",
 			label: "SemIf model",
-			description: "Model name, e.g. semif-exl3-bridge or jev-latest.",
-			get: (s) => s.semif.model,
+			description: "Picked from the server's /v1/models list. (auto) = the server's only model.",
+			get: (s) => s.semif.model || AUTO_MODEL,
 			set: (s, v) => {
-				s.semif.model = v;
+				s.semif.model = v === AUTO_MODEL ? "" : v;
 			},
-			kind: "text",
+			kind: "remote-model",
+			listModels: (draft, signal) => new SemIfClient(draft).listModels(signal),
 		},
 		{
 			id: "semif.maxQuestions",
 			label: "SemIf questions per request",
-			description: "Split the judge's questions over several requests if the server limits --max-questions.",
+			description: "Split the judge's questions over several requests if the server limits --max-questions (1-255).",
 			get: (s) => String(s.semif.maxQuestions),
 			set: (s, v) => {
 				s.semif.maxQuestions = num(v);
 			},
 			kind: "number",
 			min: 1,
-			max: 64,
+			max: 255,
 			integer: true,
 		},
 		{
@@ -365,6 +372,49 @@ export async function openSettings(ctx: ExtensionCommandContext, engine: Realmem
 		...ctx.modelRegistry.getAvailable().map((m) => ({ value: `${m.provider}/${m.id}`, label: `${m.provider}/${m.id}`, description: m.name })),
 	];
 
+	/** Model list from the server (draft endpoint and key), then optionally a typed name. */
+	const remoteModelPicker = (tui: TUI, theme: Theme, d: FieldDef, current: string, close: (v?: string) => void): Component => {
+		let child: Component;
+		const typed = () =>
+			new InputSubmenu({
+				theme,
+				label: d.label,
+				help: "Model name sent to the API, when the server does not list it. Empty = (auto).",
+				value: current === AUTO_MODEL ? "" : current,
+				done: (v) => close(v === undefined ? undefined : v || AUTO_MODEL),
+			});
+		child = new RemotePicker({
+			tui,
+			theme,
+			title: d.label,
+			selected: current,
+			load: async (signal) => {
+				const probe = normalizeSettings(structuredClone(draft));
+				const ids = await (d.listModels?.(probe, signal) ?? Promise.resolve([]));
+				const items: SelectItem[] = ids.map((id) => ({ value: id, label: id, description: id === current ? "current" : "listed by the server" }));
+				if (current !== AUTO_MODEL && !ids.includes(current)) items.unshift({ value: current, label: current, description: "current (not listed by the server)" });
+				return items;
+			},
+			extra: [
+				{ value: AUTO_MODEL, label: AUTO_MODEL, description: "no model set: use the server's only model" },
+				{ value: TYPE_MODEL, label: "✎ type a name…", description: "enter a model name by hand" },
+			],
+			done: (v) => {
+				if (v === TYPE_MODEL) {
+					child = typed();
+					tui.requestRender();
+					return;
+				}
+				close(v);
+			},
+		});
+		return {
+			render: (w: number) => child.render(w),
+			handleInput: (data: string) => child.handleInput?.(data),
+			invalidate: () => child.invalidate(),
+		};
+	};
+
 	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 		let list: SettingsList;
 		const items: SettingItem[] = defs.map((d) => ({
@@ -380,6 +430,7 @@ export async function openSettings(ctx: ExtensionCommandContext, engine: Realmem
 							if (d.kind === "model") {
 								return new FilterPicker({ theme, title: d.label, items: models, selected: current, done: (v) => close(v) });
 							}
+							if (d.kind === "remote-model") return remoteModelPicker(tui, theme, d, current, close);
 							if (d.kind === "action") {
 								if (d.id === "reset") {
 									const keep = { embedding: draft.embedding, semif: draft.semif, rewriteModel: draft.rewriteModel };
@@ -440,7 +491,7 @@ export async function openSettings(ctx: ExtensionCommandContext, engine: Realmem
 			(id, value) => {
 				const d = defs.find((x) => x.id === id);
 				if (!d || d.kind === "action") return;
-				if (d.kind === "cycle" || d.kind === "model") {
+				if (d.kind === "cycle" || d.kind === "model" || d.kind === "remote-model") {
 					d.set?.(draft, value);
 					draft = normalizeSettings(draft);
 					dirty = true;
