@@ -249,6 +249,7 @@ export interface Signals {
 	/** Path urgency, 0 (Low) .. 2 (High). */
 	urgency?: number;
 	urgencyProbs?: Record<string, number>;
+	urgencyConfidence?: number;
 }
 
 function pick(a: SemIfAnswer | undefined): ChoicePick | undefined {
@@ -284,6 +285,7 @@ export function readSignals(answers: SemIfResponse["answers"]): Signals {
 	if (urg?.type === "score") {
 		s.urgency = urg.score;
 		s.urgencyProbs = urg.probabilities;
+		s.urgencyConfidence = urg.confidence;
 	}
 	return s;
 }
@@ -305,6 +307,9 @@ export interface Decision {
 	widen?: boolean;
 	/** Path urgency judged for the candidate (0..2), when its paths are specific. */
 	urgency?: number;
+	/** Probability per urgency level ("0" Low .. "2" High) and the judge's confidence. */
+	urgencyProbs?: Record<string, number>;
+	urgencyConfidence?: number;
 	/** Human-readable trace of how the decision was reached. */
 	reasons: string[];
 }
@@ -369,6 +374,7 @@ export function decide(input: DecideInput, t: Settings["thresholds"]): Decision 
 	reasons.push(paths ? `paths ${paths.map((p) => showPath(p, root)).join(", ")}` : `paths: whole ${scope === "global" ? "user directory (~)" : "project"} (default)`);
 	if (s.urgency !== undefined && paths) reasons.push(`path urgency ${s.urgency.toFixed(2)}/2`);
 	const urgency = paths ? s.urgency : undefined;
+	const urgencyDetail = urgency !== undefined ? { urgencyProbs: s.urgencyProbs, urgencyConfidence: s.urgencyConfidence } : {};
 	const targetScopes = (m: MemoryRow) => absoluteScopes(m, root);
 	const widenOf = (target: MemoryRow) =>
 		!!paths && !pathsCover(targetScopes(target), paths) && paths.every((p) => fromAbsoluteScope(p, target.kind, root) !== undefined);
@@ -377,7 +383,7 @@ export function decide(input: DecideInput, t: Settings["thresholds"]): Decision 
 		reasons.push("an identical memory already exists");
 		const widen = widenOf(input.exact);
 		if (widen) reasons.push(`→ widen its paths with ${paths?.map((p) => showPath(p, root)).join(", ")}`);
-		return { action: "reinforce", scope, target: input.exact, paths, widen, urgency, reasons };
+		return { action: "reinforce", scope, target: input.exact, paths, widen, urgency, ...urgencyDetail, reasons };
 	}
 
 	if (s.unsafe !== undefined && s.unsafe >= t.maxUnsafe) {
@@ -460,5 +466,5 @@ export function decide(input: DecideInput, t: Settings["thresholds"]): Decision 
 	const finalScope = target ? target.kind : scope;
 	const widen = action === "reinforce" && !!target && widenOf(target);
 	if (widen) reasons.push(`→ widen its paths with ${paths?.map((p) => showPath(p, root)).join(", ")}`);
-	return { action, scope: finalScope, target, paths, widen, urgency, reasons };
+	return { action, scope: finalScope, target, paths, widen, urgency, ...urgencyDetail, reasons };
 }

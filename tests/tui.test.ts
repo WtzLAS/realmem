@@ -107,6 +107,8 @@ before(async () => {
 			const answers: Record<string, unknown> = {};
 			for (const [k, q] of Object.entries<any>(body.questions)) {
 				if (q.type === "noul") answers[k] = { type: "noul", noul: k === "unsafe" ? 0.01 : 0.95 };
+				else if (q.type === "score" && k === "path_urgency")
+					answers[k] = { type: "score", score: 1.7, legend: { 0: "Low", 1: "Mid", 2: "High" }, probabilities: { 0: 0.05, 1: 0.2, 2: 0.75 }, confidence: 0.6 };
 				else if (q.type === "score") answers[k] = { type: "score", score: 2.4, legend: { 0: "trivial" }, probabilities: { 0: 0.1, 1: 0.1, 2: 0.3, 3: 0.5 }, confidence: 0.4 };
 				else {
 					const keys = Object.keys(q.criteria);
@@ -188,6 +190,68 @@ test("manage page: browse, filter, view metadata, edit and delete", async () => 
 		const files = readdirSync(join(base, "global")).filter((f) => f.endsWith(".md"));
 		assert.equal(files.length, 1, "only the ripgrep memory is left");
 		assert.ok(!readFileSync(join(base, "global", files[0]), "utf8").includes("fd-find"));
+	} finally {
+		e.close();
+	}
+});
+
+test("path urgency: debug page shows the judge's breakdown, manage page shows the stored one", async () => {
+	const e = new Realmem(base);
+	try {
+		let report = "";
+		const { ctx } = fakeCtx(
+			proj,
+			[
+				() => {}, // loader
+				(c) => c.handleInput?.("p"), // first report: set candidate paths
+				() => {}, // loader (rerun with paths)
+				(c, frame) => {
+					for (let i = 0; i < 20; i++) {
+						report += `${frame().join("\n")}\n`;
+						c.handleInput?.(" ");
+					}
+					c.handleInput?.("w");
+				},
+			],
+			{ editor: ["Migrations are append-only\nNever edit a migration that was released; add a new one.", "db/migrations"], confirm: [true] },
+		);
+		await openDebug(ctx, e, () => {});
+		for (const s of ["Path urgency", "candidate: 1.70/2 → high (shown in full on path touch)", "High", "75.0%", "confidence 60.0%", "on write: stored with the new memory", "p paths: db/mi"])
+			assert.ok(report.includes(s), `debug report shows ${s}`);
+
+		const m = e.db.list(e.scopes(proj).stores.map((s) => s.id), { limit: 99, offset: 0 }).find((x) => x.caption === "Migrations are append-only");
+		assert.ok(m, "committed");
+		const g = e.db.getUrgency(m.store, m.id);
+		assert.equal(g?.score, 1.7);
+		assert.deepEqual(g?.probabilities, { 0: 0.05, 1: 0.2, 2: 0.75 });
+		assert.equal(g?.confidence, 0.6);
+
+		let list = "";
+		let detail = "";
+		const { ctx: ctx2 } = fakeCtx(
+			proj,
+			[
+				(c, frame) => {
+					type(c, "append-only");
+					list = frame().join("\n");
+					c.handleInput?.(KEY.enter);
+				},
+				(c, frame) => {
+					for (let i = 0; i < 5; i++) {
+						detail += `${frame().join("\n")}\n`;
+						c.handleInput?.(" ");
+					}
+					c.handleInput?.(KEY.esc);
+				},
+				(c) => c.handleInput?.(KEY.esc),
+			],
+			{},
+		);
+		await openManage(ctx2, e);
+		assert.ok(list.includes("G● "), `list shows the urgency tier:\n${list}`);
+		for (const s of ["path urgency", "1.70/2 → high (shown in full on path touch)", "judged when remembered", "High", "75.0%", "confidence 60.0%", "full ≥ 1.50"])
+			assert.ok(detail.includes(s), `manage detail shows ${s}`);
+		await e.deleteMemory(m);
 	} finally {
 		e.close();
 	}

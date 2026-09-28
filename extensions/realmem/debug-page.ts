@@ -5,11 +5,14 @@
  */
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { SemIfAnswer } from "../../src/api.ts";
-import { CandidateError, type Realmem, type RememberOutcome } from "../../src/engine.ts";
+import { CandidateError, type Realmem, type RememberOutcome, urgencyBasis } from "../../src/engine.ts";
 import { SCOPE_LABEL, type ScopeKind } from "../../src/files.ts";
+import { scopePaths } from "../../src/format.ts";
+import { urgencyTier } from "../../src/judge.ts";
 import { oneLine, truncate } from "../../src/text.ts";
 import { rewriterFor } from "./tools.ts";
 import { runWithLoader, showText } from "./ui.ts";
+import { urgencyBreakdown, urgencySummary } from "./urgency-view.ts";
 
 const pct = (p: number | undefined) => (p === undefined ? "n/a" : `${(p * 100).toFixed(1)}%`);
 
@@ -31,7 +34,47 @@ function answerLines(t: Theme, name: string, a: SemIfAnswer, labels: Map<string,
 	return out;
 }
 
-function reportLines(o: RememberOutcome, showState: boolean): (t: Theme) => string[] {
+/** Urgency the judge gave the candidate, what the write would store, and the target's current one. */
+function pathUrgencyLines(t: Theme, o: RememberOutcome, engine: Realmem): string[] {
+	const th = engine.settings.thresholds;
+	const out: string[] = [];
+	const d = o.decision;
+	if (!engine.settings.paths.inject) out.push(t.fg("warning", "path notes are off (settings): urgency has no effect right now"));
+	if (!d?.paths) {
+		out.push(
+			t.fg(
+				"muted",
+				o.candidate.paths
+					? "not used: the candidate's paths were dropped, it covers the whole root"
+					: "not asked: no paths, the memory covers the whole root and is never shown on path touch",
+			),
+		);
+	} else if (d.urgency === undefined) {
+		out.push(t.fg("muted", o.trace.judge ? "judge returned no path_urgency answer" : "not judged (SemIf not run)"));
+	} else {
+		out.push(`candidate: ${urgencySummary(t, d.urgency, th)}`);
+		out.push(...urgencyBreakdown(t, { score: d.urgency, probabilities: d.urgencyProbs, confidence: d.urgencyConfidence }, th, "  "));
+		const effect =
+			d.action === "add"
+				? "stored with the new memory"
+				: d.action === "edit" || d.action === "merge" || (d.action === "reinforce" && d.widen)
+					? "not stored: the target's content or paths change, so its urgency is re-judged in the background"
+					: "not stored: the target keeps its own urgency";
+		out.push(t.fg("muted", `on write: ${effect}`));
+	}
+	const target = d?.target;
+	if (target && scopePaths(target)) {
+		const g = engine.db.getUrgency(target.store, target.id);
+		const current = g && g.basis === urgencyBasis(target);
+		out.push(
+			`target ${target.id}: ${g ? (current ? urgencySummary(t, g.score, th) : t.fg("warning", `stale ${g.score.toFixed(2)}/2, re-judged soon`)) : "not judged yet (caption)"}`,
+		);
+	} else if (target) out.push(t.fg("muted", `target ${target.id}: covers the whole root, no urgency`));
+	return out;
+}
+
+function reportLines(o: RememberOutcome, showState: boolean, engine: Realmem): (t: Theme) => string[] {
+	const th = engine.settings.thresholds;
 	return (t) => {
 		const out: string[] = [];
 		const h = (s: string) => {
@@ -42,7 +85,6 @@ function reportLines(o: RememberOutcome, showState: boolean): (t: Theme) => stri
 
 		h("Candidate");
 		out.push(`caption: ${o.candidate.caption}`);
-		if (o.candidate.paths) out.push(`paths: ${o.candidate.paths.join(", ")}`);
 		if (o.candidate.scopeHint) out.push(`scope hint: ${SCOPE_LABEL[o.candidate.scopeHint]}`);
 		out.push(`paths: ${o.candidate.paths ? o.candidate.paths.join(", ") : "(none: whole project root, or ~ for global)"}`);
 		for (const l of o.candidate.content.split("\n")) out.push(t.fg("muted", `  ${l}`));
@@ -86,10 +128,13 @@ function reportLines(o: RememberOutcome, showState: boolean): (t: Theme) => stri
 
 		h("Decision");
 		if (o.decision) {
-			if (o.decision.paths) out.push(`paths: ${o.decision.paths.join(", ")}${o.decision.urgency !== undefined ? ` · urgency ${o.decision.urgency.toFixed(2)}/2` : ""}${o.decision.widen ? " · widens target" : ""}`);
+			if (o.decision.paths) out.push(`paths: ${o.decision.paths.join(", ")}${o.decision.urgency !== undefined ? ` · urgency ${o.decision.urgency.toFixed(2)}/2 (${urgencyTier(o.decision.urgency, th)})` : ""}${o.decision.widen ? " · widens target" : ""}`);
 			out.push(`${t.bold(o.decision.action.toUpperCase())} → ${SCOPE_LABEL[o.decision.scope]}${o.decision.target ? ` · target ${o.decision.target.id} "${oneLine(o.decision.target.caption, 60)}"` : ""}`);
 			for (const r of o.decision.reasons) out.push(t.fg("muted", `  • ${r}`));
 		} else out.push(t.fg("muted", "none"));
+
+		h("Path urgency");
+		out.push(...pathUrgencyLines(t, o, engine));
 
 		if (o.before || o.proposed) {
 			h(o.trace.rewrite ? `Rewrite (${o.trace.rewrite.model}, ${o.trace.rewrite.ms} ms)` : "Memory to write");
@@ -136,8 +181,9 @@ export async function openDebug(ctx: ExtensionCommandContext, engine: Realmem, o
 	if (!cand) return;
 	let scope: ScopeKind | undefined;
 	let force = false;
+	let paths: string[] | undefined;
 	for (;;) {
-		const input = { caption: cand.caption, content: cand.content, scope, force, source: "debug" as const };
+		const input = { caption: cand.caption, content: cand.content, paths, scope, force, source: "debug" as const };
 		const rw = rewriterFor(engine, ctx);
 		const r = await runWithLoader(ctx, "running remember path (dry run)", (signal, setMessage) =>
 			engine.remember(input, { cwd: ctx.cwd, dryRun: true, rewriter: rw.rewriter, signal, onStep: (s) => setMessage(`dry run: ${s}`) }),
@@ -152,13 +198,14 @@ export async function openDebug(ctx: ExtensionCommandContext, engine: Realmem, o
 		}
 		const outcome = r.value;
 		let showState = false;
-		let action: "commit" | "edit" | "state" | "scope" | "force" | "rerun" | undefined;
+		let action: "commit" | "edit" | "state" | "scope" | "paths" | "force" | "rerun" | undefined;
 		for (;;) {
 			const canCommit = outcome.status === "planned";
-			action = await showText(ctx, `realmem debug · ${outcome.status}${rw.model ? ` · rewrite model ${rw.model}` : ""}`, reportLines(outcome, showState), [
+			action = await showText(ctx, `realmem debug · ${outcome.status}${rw.model ? ` · rewrite model ${rw.model}` : ""}`, reportLines(outcome, showState, engine), [
 				...(canCommit ? [{ id: "commit" as const, key: "w", label: "write to memory" }] : []),
 				{ id: "edit" as const, key: "e", label: "edit candidate" },
 				{ id: "scope" as const, key: "s", label: `scope: ${scope ? SCOPE_LABEL[scope] : "auto"}` },
+				{ id: "paths" as const, key: "p", label: `paths: ${paths ? oneLine(paths.join(", "), 30) : "none"}` },
 				{ id: "force" as const, key: "f", label: `user_requested: ${force ? "yes" : "no"}` },
 				{ id: "rerun" as const, key: "r", label: "rerun" },
 				{ id: "state" as const, key: "v", label: showState ? "hide raw request" : "show raw request" },
@@ -184,6 +231,16 @@ export async function openDebug(ctx: ExtensionCommandContext, engine: Realmem, o
 		}
 		if (action === "edit") cand = (await askCandidate(ctx, cand)) ?? cand;
 		else if (action === "force") force = !force;
+		else if (action === "paths") {
+			const v = await ctx.ui.editor(
+				"Candidate paths, one per line: files, directories or globs relative to the cwd, ~/… or absolute (empty = whole root)",
+				(paths ?? []).join("\n"),
+			);
+			if (v !== undefined) {
+				const list = v.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+				paths = list.length > 0 ? list : undefined;
+			}
+		}
 		else if (action === "scope") {
 			const sc = engine.scopes(ctx.cwd);
 			const opts = ["auto", ...sc.stores.map((s) => SCOPE_LABEL[s.kind])];

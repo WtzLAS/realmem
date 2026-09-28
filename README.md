@@ -173,6 +173,9 @@ Moving a memory between stores (manage page) re-expresses its paths.
 - **Urgency** is judged when the memory is remembered. For hand-written or edited
   memories it is judged in the background by SemIf, and it is re-judged whenever the
   content or paths change.
+  `/realmem manage` shows it per memory (score, tier under the current thresholds,
+  per-level probabilities, confidence, source; ● full · ◐ caption · ○ count · ? unjudged
+  in the list); `/realmem debug` shows what the judge gave a candidate (`p` sets its paths).
 - **Recall ranks, never filters, by path**: memories covering the given or recently
   touched paths come first, project-wide ones next, those about other areas last.
 - **Missing paths.** At session start, scopes that no longer exist are flagged (✗ in
@@ -218,9 +221,9 @@ Moving a memory between stores (manage page) re-expresses its paths.
 
 | Subcommand | Does |
 |---|---|
-| `manage [query]` | browse all memories (filter or semantic search); view content and metadata; edit, re-scope, move, delete, approve quarantined ones |
+| `manage [query]` | browse all memories (filter or semantic search); view content and metadata, including path urgency; edit, re-scope, move, delete, approve quarantined ones |
 | `settings` | Edit/Merge model, embedding and SemIf endpoints, keys and models, thresholds, limits; built-in connectivity tests |
-| `debug` | dry-run the full remember path and show the embedding, neighbours (cos / BM25 / RRF), raw SemIf answers and probabilities, the decision trace and the rewrite diff; `w` writes it for real |
+| `debug` | dry-run the full remember path and show the embedding, neighbours (cos / BM25 / RRF), raw SemIf answers and probabilities, the decision trace, the path urgency (tier, per-level probabilities, what the write would store; `p` sets candidate paths) and the rewrite diff; `w` writes it for real |
 | `add` | remember a fact yourself |
 | `import` | the agent splits AGENTS.md / CLAUDE.md into facts |
 | `fix-gitignore` | check whether `.pi/realmem` is ignored by git and append the verified fix |

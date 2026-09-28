@@ -6,7 +6,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ScopeKind } from "./files.ts";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export interface MemoryRow {
 	rid: number;
@@ -36,6 +36,10 @@ export interface UrgencyRow {
 	score: number;
 	source: string;
 	basis: string;
+	/** Probability per urgency level ("0" Low .. "2" High), when the judge returned them. */
+	probabilities?: Record<string, number>;
+	confidence?: number;
+	updated: number;
 }
 
 export interface PathStateRow {
@@ -298,6 +302,11 @@ export class RealmemDB {
 						PRIMARY KEY(store, id)
 					);
 				`);
+			}
+			if (version < 3) {
+				const cols = (this.db.prepare("PRAGMA table_info(urgency)").all() as Array<{ name: string }>).map((c) => c.name);
+				if (!cols.includes("probs")) this.db.exec("ALTER TABLE urgency ADD COLUMN probs TEXT");
+				if (!cols.includes("confidence")) this.db.exec("ALTER TABLE urgency ADD COLUMN confidence REAL");
 			}
 			this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 		});
@@ -672,14 +681,40 @@ export class RealmemDB {
 	// -------------------------------------------------------------------------
 
 	getUrgency(store: string, id: string): UrgencyRow | undefined {
-		const r = this.stmt("SELECT score, source, basis FROM urgency WHERE store = ? AND id = ?").get(store, id) as Row | undefined;
-		return r ? { score: Number(r.score), source: String(r.source), basis: String(r.basis) } : undefined;
+		const r = this.stmt("SELECT score, source, basis, probs, confidence, updated FROM urgency WHERE store = ? AND id = ?").get(store, id) as Row | undefined;
+		if (!r) return undefined;
+		let probabilities: Record<string, number> | undefined;
+		if (typeof r.probs === "string") {
+			try {
+				probabilities = JSON.parse(r.probs) as Record<string, number>;
+			} catch {
+				probabilities = undefined;
+			}
+		}
+		return {
+			score: Number(r.score),
+			source: String(r.source),
+			basis: String(r.basis),
+			probabilities,
+			confidence: r.confidence === null || r.confidence === undefined ? undefined : Number(r.confidence),
+			updated: Number(r.updated),
+		};
 	}
 
-	setUrgency(store: string, id: string, score: number, source: string, basis: string): void {
+	setUrgency(
+		store: string,
+		id: string,
+		score: number,
+		source: string,
+		basis: string,
+		detail: { probabilities?: Record<string, number>; confidence?: number } = {},
+	): void {
+		const probs = detail.probabilities && Object.keys(detail.probabilities).length > 0 ? JSON.stringify(detail.probabilities) : null;
 		this.stmt(
-			"INSERT INTO urgency(store, id, score, source, basis, updated) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(store, id) DO UPDATE SET score = excluded.score, source = excluded.source, basis = excluded.basis, updated = excluded.updated",
-		).run(store, id, score, source, basis, Date.now());
+			`INSERT INTO urgency(store, id, score, source, basis, probs, confidence, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(store, id) DO UPDATE SET score = excluded.score, source = excluded.source, basis = excluded.basis,
+			 probs = excluded.probs, confidence = excluded.confidence, updated = excluded.updated`,
+		).run(store, id, score, source, basis, probs, detail.confidence ?? null, Date.now());
 	}
 
 	/** Path-scoped memories whose urgency is missing or was judged for other content/paths. */

@@ -10,10 +10,61 @@ import { SCOPE_LABEL, type ScopeKind } from "../../src/files.ts";
 import { canonical, fmtTime, scopePaths } from "../../src/format.ts";
 import { idTimestamp } from "../../src/ids.ts";
 import { oneLine } from "../../src/text.ts";
-import { urgencyTier } from "../../src/judge.ts";
+import { type UrgencyTier, urgencyTier } from "../../src/judge.ts";
 import { FilterPicker, runWithLoader, showText } from "./ui.ts";
+import { tierColor, urgencyBreakdown, urgencySummary } from "./urgency-view.ts";
 
 const SHORT: Record<ScopeKind, string> = { global: "G", shared: "S", personal: "P" };
+
+const SOURCE_LABEL: Record<string, string> = {
+	remember: "judged when remembered",
+	judge: "judged in the background (hand-written or edited memory)",
+};
+
+/** Path urgency section of a memory page: score, tier, effect on touch, per-level breakdown. */
+function urgencyLines(engine: Realmem, m: MemoryRow): (t: Theme) => string[] {
+	return (t) => {
+		const th = engine.settings.thresholds;
+		const pad = (k: string) => t.fg("muted", k.padEnd(10));
+		if (!scopePaths(m)) {
+			return [`${pad("urgency")} ${t.fg("dim", "n/a: covers the whole root, never shown on path touch (reached through realmem_recall)")}`];
+		}
+		const out: string[] = [];
+		if (!engine.settings.paths.inject) out.push(t.fg("warning", "path notes are off (settings): urgency has no effect right now"));
+		const g = engine.db.getUrgency(m.store, m.id);
+		if (!g) {
+			const tier = urgencyTier(undefined, th);
+			out.push(`${pad("urgency")} not judged yet → ${t.fg(tierColor(tier), tier)} until judged (caption shown on path touch)`);
+			out.push(`${pad("")} ${t.fg("dim", "judged in the background by SemIf at session start and after writes")}`);
+			return out;
+		}
+		const current = g.basis === urgencyBasis(m);
+		if (current) out.push(`${pad("urgency")} ${urgencySummary(t, g.score, th)}`);
+		else {
+			const tier = urgencyTier(undefined, th);
+			out.push(`${pad("urgency")} ${t.fg("warning", `stale: ${g.score.toFixed(2)}/2 was judged for older content or paths`)}`);
+			out.push(`${pad("")} treated as ${t.fg(tierColor(tier), tier)} (caption) until re-judged in the background`);
+		}
+		out.push(`${pad("source")} ${SOURCE_LABEL[g.source] ?? g.source}, ${fmtTime(g.updated)}`);
+		out.push(`${pad("levels")}`, ...urgencyBreakdown(t, g, th, "  "));
+		return out;
+	};
+}
+
+const TIER_MARK: Record<UrgencyTier, string> = { high: "●", mid: "◐", low: "○" };
+
+/**
+ * Urgency for the list: `mark` is a one-char column next to the scope letter
+ * (● full, ◐ caption, ○ count, ? unjudged, blank = whole root), `long` goes in the
+ * description ("urgency 1.62 high").
+ */
+function urgencyTag(engine: Realmem, m: MemoryRow): { mark: string; long: string } {
+	if (!scopePaths(m)) return { mark: " ", long: "" };
+	const g = engine.db.getUrgency(m.store, m.id);
+	if (!g || g.basis !== urgencyBasis(m)) return { mark: "?", long: " · urgency not judged yet" };
+	const tier = urgencyTier(g.score, engine.settings.thresholds);
+	return { mark: TIER_MARK[tier], long: ` · urgency ${g.score.toFixed(2)} ${tier}` };
+}
 
 function memoryLines(engine: Realmem, m: MemoryRow): (theme: Theme) => string[] {
 	return (t) => {
@@ -31,17 +82,13 @@ function memoryLines(engine: Realmem, m: MemoryRow): (theme: Theme) => string[] 
 			["hash", m.hash.slice(0, 16)],
 			["vector", m.vecHash === m.hash ? "indexed" : "pending"],
 		];
-		if (scopePaths(m)) {
-			const g = engine.db.getUrgency(m.store, m.id);
-			const current = g && g.basis === urgencyBasis(m);
-			const tier = current ? urgencyTier(g.score, engine.settings.thresholds) : undefined;
-			meta.push(["urgency", g ? `${g.score.toFixed(2)}/2 → ${tier ?? "stale, re-judged soon"} (${g.source})${tier === "high" ? " · shown in full" : tier === "mid" ? " · caption" : tier === "low" ? " · counted" : ""}` : "not judged yet (caption)"]);
-		}
+		const urgency = urgencyLines(engine, m);
 		const ps = engine.db.getPathState(m.store, m.id);
 		if (ps) meta.push(["missing", `${ps.missing.join(", ")}${ps.suggestion ? ` → moved to ${ps.suggestion}? (press f)` : ""}`]);
 		if (m.flags) meta.push(["quarantine", m.flags]);
 		const out = [t.bold(m.caption), ""];
 		for (const [k, v] of meta) out.push(`${t.fg("muted", k.padEnd(10))} ${k === "quarantine" || k === "missing" ? t.fg("warning", v) : v}`);
+		out.push("", t.fg("borderMuted", "path urgency"), "", ...urgency(t));
 		out.push("", t.fg("borderMuted", "content"), "");
 		for (const l of m.content.split("\n")) out.push(l);
 		return out;
@@ -138,14 +185,15 @@ async function memoryPage(ctx: ExtensionCommandContext, engine: Realmem, initial
 	}
 }
 
-function listItems(rows: MemoryRow[], stale: Set<string>): SelectItem[] {
+function listItems(engine: Realmem, rows: MemoryRow[], stale: Set<string>): SelectItem[] {
 	return rows.map((m) => {
 		const where = scopePaths(m);
 		const mark = m.flags ? "⚠" : stale.has(m.id) ? "✗" : SHORT[m.kind];
+		const u = urgencyTag(engine, m);
 		return {
 			value: m.id,
-			label: `${mark} ${String(m.usedCount).padStart(3)}  ${where ? `${oneLine(where, 28)} · ` : ""}${oneLine(m.caption, 90)}`,
-			description: `${SCOPE_LABEL[m.kind]}${where ? ` · ${where}` : ""}${stale.has(m.id) ? " · path missing" : ""} · ${oneLine(m.content, 160)}`,
+			label: `${mark}${u.mark} ${String(m.usedCount).padStart(3)}  ${where ? `${oneLine(where, 28)} · ` : ""}${oneLine(m.caption, 90)}`,
+			description: `${SCOPE_LABEL[m.kind]}${where ? ` · ${where}` : ""}${u.long}${stale.has(m.id) ? " · path missing" : ""} · ${oneLine(m.content, 160)}`,
 		};
 	});
 }
@@ -186,13 +234,13 @@ export async function openManage(ctx: ExtensionCommandContext, engine: Realmem, 
 		}
 		const items: SelectItem[] = [
 			{ value: "__search", label: query ? "↺ clear search" : "🔎 semantic search…", description: "hybrid vector + keyword search (does not count as usage)" },
-			...listItems(rows, engine.db.stalePathIds(storeIds)),
+			...listItems(engine, rows, engine.db.stalePathIds(storeIds)),
 		];
 		const picked = await ctx.ui.custom<string | undefined>(
 			(tui, theme, _kb, done) =>
 				new FilterPicker({
 					theme,
-					title: `${title}  —  by path, then used · G global · S shared · P personal · ⚠ quarantined · ✗ path missing`,
+					title: `${title}  —  by path, then used · G global · S shared · P personal · ⚠ quarantined · ✗ path missing · on path touch: ● full ◐ caption ○ count ? unjudged`,
 					items,
 					selected: lastSelected,
 					maxVisible: Math.max(5, tui.terminal.rows - 8),

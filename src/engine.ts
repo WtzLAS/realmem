@@ -432,7 +432,7 @@ export class Realmem {
 				].join("\n");
 				const r = await this.semif.evaluate(state, { path_urgency: pathUrgencyQuestion() }, signal);
 				const a = r.response.answers.path_urgency;
-				if (a?.type === "score") this.db.setUrgency(m.store, m.id, a.score, "judge", urgencyBasis(m));
+				if (a?.type === "score") this.db.setUrgency(m.store, m.id, a.score, "judge", urgencyBasis(m), { probabilities: a.probabilities, confidence: a.confidence });
 				done++;
 			}
 		}
@@ -792,7 +792,7 @@ export class Realmem {
 				if (store.kind === "personal" && ctx.project) writeProjectInfo(store.dir, ctx.project);
 				const row = this.index.writeMemory(store, mem);
 				if (d.urgency !== undefined && !isWholeScope(row.paths ?? undefined)) {
-					this.db.setUrgency(row.store, row.id, d.urgency, "remember", urgencyBasis(row));
+					this.db.setUrgency(row.store, row.id, d.urgency, "remember", urgencyBasis(row), { probabilities: d.urgencyProbs, confidence: d.urgencyConfidence });
 				}
 				outcome.memory = row;
 				outcome.status = "added";
