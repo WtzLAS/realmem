@@ -80,7 +80,7 @@ test("extension registers tools, skill, command; freezes the session prompt; str
 		sendUserMessage: () => {},
 	};
 	realmem(pi);
-	assert.deepEqual([...tools.keys()].sort(), ["realmem_list", "realmem_recall", "realmem_remember", "realmem_status"]);
+	assert.deepEqual([...tools.keys()].sort(), ["realmem_forget", "realmem_list", "realmem_recall", "realmem_remember", "realmem_status"]);
 	assert.ok(commands.has("realmem"));
 	const emit = async (e: string, ev: any, ctx: any) => {
 		let last: any;

@@ -451,9 +451,9 @@ export class Realmem {
 	}
 
 	/** Flag path-scoped memories whose paths no longer exist (with a rename suggestion from git). */
-	checkPaths(cwd: string): { checked: number; stale: number } {
+	checkPaths(cwd: string, force = false): { checked: number; stale: number } {
 		const ctx = this.scopes(cwd);
-		if (!this.settings.paths.staleCheck) return { checked: 0, stale: 0 };
+		if (!force && !this.settings.paths.staleCheck) return { checked: 0, stale: 0 };
 		const noGit = { head: "", files: undefined, renames: new Map<string, string>() };
 		const repo = ctx.project ? repoFiles(ctx.project.root, ctx.project.isGit) : noGit;
 		let stale = 0;
@@ -472,6 +472,45 @@ export class Realmem {
 			}
 		});
 		return { checked: rows.length, stale };
+	}
+
+	/**
+	 * Drop paths that no longer exist from path-scoped memories; a memory whose paths are
+	 * all gone is deleted. `dryRun` only reports what would change.
+	 */
+	async prunePaths(
+		cwd: string,
+		opts: { dryRun?: boolean } = {},
+	): Promise<{ updated: Array<{ memory: MemoryRow; removed: string[] }>; deleted: MemoryRow[] }> {
+		this.sync(cwd);
+		this.resetRepoCache();
+		this.checkPaths(cwd, true);
+		const ctx = this.scopes(cwd);
+		const updated: Array<{ memory: MemoryRow; removed: string[] }> = [];
+		const deleted: MemoryRow[] = [];
+		for (const s of this.db.scopedPaths(ctx.stores.map((x) => x.id))) {
+			const missing = this.db.getPathState(s.store, s.id)?.missing ?? [];
+			if (missing.length === 0) continue;
+			const row = this.db.getById(s.id, [s.store]);
+			if (!row) continue;
+			const keep = (row.paths ?? []).filter((p) => !missing.includes(p));
+			if (keep.length === 0) {
+				if (!opts.dryRun) await this.deleteMemory(row);
+				deleted.push(row);
+			} else {
+				const out = opts.dryRun ? row : await this.updateMemory(cwd, row, { paths: keep });
+				updated.push({ memory: out, removed: missing });
+			}
+		}
+		if (!opts.dryRun && updated.length > 0) this.checkPaths(cwd, true);
+		return { updated, deleted };
+	}
+
+	/** Delete memories by id (full id or unique prefix). */
+	async forget(cwd: string, ids: string[]): Promise<{ deleted: MemoryRow[]; missing: string[] }> {
+		const { found, missing } = this.getMemories(cwd, ids, false);
+		for (const m of found) await this.deleteMemory(m);
+		return { deleted: found, missing };
 	}
 
 	/** Forget cached git listings (e.g. at session start). */

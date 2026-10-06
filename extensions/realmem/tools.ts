@@ -1,5 +1,5 @@
 /**
- * Model-facing tools: realmem_recall, realmem_remember, realmem_status, realmem_list.
+ * Model-facing tools: realmem_recall, realmem_remember, realmem_status, realmem_list, realmem_forget.
  */
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -195,6 +195,23 @@ export function registerTools(pi: ExtensionAPI, host: ToolHost): void {
 			const page = Math.min(Math.max(1, params.page ?? 1), pages);
 			const rows = engine.db.list(stores, { limit: pageSize, offset: (page - 1) * pageSize, order: "path" });
 			return { content: text(formatList(rows, total, page, pageSize)), details: { total, page, pages } };
+		},
+	});
+
+	pi.registerTool({
+		name: "realmem_forget",
+		label: "realmem forget",
+		description:
+			"Delete memories from long-term memory (realmem) by id. Use only for memories that are wrong, obsolete or unwanted and cannot be corrected with realmem_remember; ids are shown by realmem_recall / realmem_list.",
+		parameters: Type.Object({
+			ids: Type.Array(Type.String({ minLength: 6, maxLength: 40 }), { minItems: 1, maxItems: 32, description: "Memory ids (or unique prefixes) to delete" }),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const engine = host.engine(ctx);
+			const r = await engine.forget(ctx.cwd, params.ids);
+			const lines = r.deleted.map((m) => `deleted ${m.id} [${SCOPE_LABEL[m.kind]}] ${m.caption}`);
+			if (r.missing.length) lines.push(`not found: ${r.missing.join(", ")}`);
+			return { content: text(lines.join("\n") || "nothing deleted"), details: { deleted: r.deleted.map((m) => m.id), missing: r.missing } };
 		},
 	});
 }

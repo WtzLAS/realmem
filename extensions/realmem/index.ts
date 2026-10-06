@@ -36,6 +36,7 @@ const SUBCOMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "embed", description: "embed memories that have no vector yet" },
 	{ name: "reindex", description: "clear the embedding cache and re-embed everything" },
 	{ name: "retry", description: "retry candidates queued while the judge was unreachable" },
+	{ name: "prune-paths", description: "drop paths that no longer exist; delete memories whose paths are all gone" },
 	{ name: "fix-gitignore", description: "check whether .pi/realmem is ignored by git and add the fix to .gitignore" },
 ];
 
@@ -126,7 +127,7 @@ export default function realmem(pi: ExtensionAPI) {
 		try {
 			const report = e.sync(ctx.cwd);
 			if (report.flagged > 0 && ctx.hasUI) {
-				ctx.ui.notify(`realmem: ${report.flagged} memor${report.flagged === 1 ? "y was" : "ies were"} quarantined by the safety scan; review with /realmem manage`, "warning");
+				ctx.ui.notify(`realmem: ${report.flagged} memor${report.flagged === 1 ? "y was" : "ies were"} quarantined by the safety scan; review with /realmem manage or clean up with /realmem prune-paths`, "warning");
 			}
 			if (report.errors.length > 0 && ctx.hasUI) {
 				ctx.ui.notify(`realmem: ${report.errors.length} unreadable memory file(s), e.g. ${report.errors[0].file}: ${report.errors[0].error}`, "warning");
@@ -340,7 +341,7 @@ export default function realmem(pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("realmem", {
-		description: "realmem long-term memory: manage, settings, debug, add, import, status, embed, reindex, retry",
+		description: "realmem long-term memory: manage, settings, debug, add, import, status, embed, reindex, retry, prune-paths",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
 			const p = prefix.trim().toLowerCase();
 			if (p.includes(" ")) return null;
@@ -415,6 +416,22 @@ export default function realmem(pi: ExtensionAPI) {
 						const r = await runWithLoader(ctx, "retrying queued memories", (signal) => e.drainPending(ctx.cwd, rw.rewriter, signal));
 						if (r.error) ctx.ui.notify(`realmem: ${r.error instanceof Error ? r.error.message : String(r.error)}`, "error");
 						else ctx.ui.notify(`realmem: processed ${r.value?.length ?? 0} queued candidate(s); ${e.db.countPending()} left`, "info");
+						break;
+					}
+					case "prune-paths":
+					case "prune": {
+						const preview = await e.prunePaths(ctx.cwd, { dryRun: true });
+						if (preview.updated.length === 0 && preview.deleted.length === 0) {
+							ctx.ui.notify("realmem: no memory refers to a missing path", "info");
+							break;
+						}
+						const lines = [
+							...preview.updated.map((u) => `edit   ${u.memory.caption}: drop ${u.removed.join(", ")}`),
+							...preview.deleted.map((m) => `delete ${m.caption}: ${(m.paths ?? []).join(", ")}`),
+						];
+						if (ctx.hasUI && !(await ctx.ui.confirm(`Prune ${lines.length} memor${lines.length === 1 ? "y" : "ies"}?`, lines.join("\n")))) return;
+						const r = await e.prunePaths(ctx.cwd);
+						ctx.ui.notify(`realmem: removed missing paths from ${r.updated.length} memor${r.updated.length === 1 ? "y" : "ies"}, deleted ${r.deleted.length}`, "info");
 						break;
 					}
 					case "fix-gitignore":

@@ -271,6 +271,39 @@ test("hand-written scoped memories get urgency in the background; missing paths 
 	}
 });
 
+test("prunePaths drops missing paths and deletes memories whose paths are all gone; forget deletes by id", async () => {
+	clearProjectCache();
+	const e = new Realmem();
+	try {
+		const dir = join(proj, ".pi", "realmem");
+		writeFileSync(
+			join(dir, "01900000-0000-7000-8000-0000000000b1.md"),
+			"---\nid: 01900000-0000-7000-8000-0000000000b1\ncaption: PRUNE partial\npaths:\n  - gone/a.ts\n  - db\n---\n\nPartly stale.\n",
+		);
+		writeFileSync(
+			join(dir, "01900000-0000-7000-8000-0000000000b2.md"),
+			"---\nid: 01900000-0000-7000-8000-0000000000b2\ncaption: PRUNE all gone\npaths:\n  - gone/b.ts\n---\n\nFully stale.\n",
+		);
+		e.sync(proj);
+		const stores = () => e.db.list(e.scopes(proj).stores.map((s) => s.id), { limit: 999, offset: 0 });
+		const dry = await e.prunePaths(proj, { dryRun: true });
+		assert.ok(dry.updated.some((u) => u.memory.caption === "PRUNE partial" && u.removed.join() === "gone/a.ts"));
+		assert.ok(dry.deleted.some((m) => m.caption === "PRUNE all gone"));
+		assert.ok(stores().some((m) => m.caption === "PRUNE all gone"), "dry run changes nothing");
+		await e.prunePaths(proj);
+		const after = stores();
+		assert.ok(!after.some((m) => m.caption === "PRUNE all gone"));
+		const partial = after.find((m) => m.caption === "PRUNE partial");
+		assert.deepEqual(partial?.paths, ["db"]);
+		const r = await e.forget(proj, [partial!.id, "nonexistent-id"]);
+		assert.equal(r.deleted.length, 1);
+		assert.deepEqual(r.missing, ["nonexistent-id"]);
+		assert.ok(!stores().some((m) => m.caption === "PRUNE partial"));
+	} finally {
+		e.close();
+	}
+});
+
 test("compaction resets the shown set; touching a parent directory does not trigger notes", async () => {
 	clearProjectCache();
 	const h = await harness();

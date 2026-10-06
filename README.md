@@ -212,6 +212,7 @@ Moving a memory between stores (manage page) re-expresses its paths.
   - `realmem_status()`
   - `realmem_list(page?, scope?)`: sorted by path, then used; demoted, since its output
     is large.
+  - `realmem_forget(ids)`: delete memories by id (or unique prefix).
 - **Skill**: `realmem` covers when and how to recall, remember, pick a scope and correct
   memories.
 
@@ -226,6 +227,7 @@ Moving a memory between stores (manage page) re-expresses its paths.
 | `debug` | dry-run the full remember path and show the embedding, neighbours (cos / BM25 / RRF), raw SemIf answers and probabilities, the decision trace, the path urgency (tier, per-level probabilities, what the write would store; `p` sets candidate paths) and the rewrite diff; `w` writes it for real |
 | `add` | remember a fact yourself |
 | `import` | the agent splits AGENTS.md / CLAUDE.md into facts |
+| `prune-paths` | drop paths that no longer exist from memories (after a confirm listing the changes); a memory whose paths are all gone is deleted |
 | `fix-gitignore` | check whether `.pi/realmem` is ignored by git and append the verified fix |
 | `status`, `embed`, `reindex`, `retry` | maintenance |
 
