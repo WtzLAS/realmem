@@ -258,15 +258,40 @@ test("judge unreachable → queued, then drained", async () => {
 		semifDown = true;
 		const o = await e.remember({ caption: "Release via tags", content: "Push a vX.Y.Z tag; CI publishes the package.", source: "agent" }, { cwd: proj, queueOnFailure: true });
 		assert.equal(o.status, "queued");
-		assert.equal(e.db.countPending(), 1);
+		assert.equal(e.pendingCount(proj), 1);
 		semifDown = false;
 		nextAnswers = undefined;
 		const done = await e.drainPending(proj, undefined);
 		assert.equal(done.length, 1);
 		assert.equal(done[0].status, "added");
-		assert.equal(e.db.countPending(), 0);
+		assert.equal(e.pendingCount(proj), 0);
 	} finally {
 		e.close();
+	}
+});
+
+test("queued candidates are local to their project", async () => {
+	const other = mkdtempSync(join(tmpdir(), "realmem-other-"));
+	execFileSync("git", ["init", "-q"], { cwd: other });
+	clearProjectCache();
+	const e = new Realmem(base);
+	try {
+		semifDown = true;
+		const o = await e.remember({ caption: "Deploy with fly", content: "Run `fly deploy` from the repo root.", source: "agent" }, { cwd: proj, queueOnFailure: true });
+		assert.equal(o.status, "queued");
+		assert.equal(e.pendingCount(proj), 1);
+		assert.equal(e.pendingCount(other), 0, "not visible from another project");
+		assert.equal((e.status(other) as { pending: number }).pending, 0);
+		semifDown = false;
+		nextAnswers = undefined;
+		assert.deepEqual(await e.drainPending(other, undefined), [], "another project does not drain it");
+		assert.equal(e.pendingCount(proj), 1);
+		const done = await e.drainPending(proj, undefined);
+		assert.equal(done.length, 1);
+		assert.equal(e.pendingCount(proj), 0);
+	} finally {
+		e.close();
+		rmSync(other, { recursive: true, force: true });
 	}
 });
 
@@ -348,7 +373,7 @@ test("fresh install: no endpoints, facts are queued, not lost; keyword recall st
 		assert.equal(o.status, "queued");
 		assert.match(o.message, /not set up/);
 		assert.deepEqual(await e.drainPending(proj, undefined), [], "no retries while unconfigured");
-		assert.equal(e.db.countPending(), 1, "still queued");
+		assert.equal(e.pendingCount(proj), 1, "still queued");
 		const st = e.status(proj) as { config: { semif: string | null; embedding: string | null } };
 		assert.equal(st.config.semif, null);
 		assert.equal(st.config.embedding, null);

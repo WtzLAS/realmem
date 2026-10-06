@@ -58,7 +58,7 @@ export default function realmem(pi: ExtensionAPI) {
 			const e = getEngine();
 			const sc = e.scopes(ctx.cwd);
 			const n = e.db.count(sc.stores.map((s) => s.id));
-			const pending = e.db.countPending();
+			const pending = e.db.countPending(sc.project?.root);
 			const setup = e.semifClient.configured ? "" : " · setup: /realmem settings";
 			ctx.ui.setStatus("realmem", `🧠 ${n}${pending ? ` (+${pending} queued)` : ""}${setup}`);
 		} catch {
@@ -69,7 +69,7 @@ export default function realmem(pi: ExtensionAPI) {
 	const drain = (ctx: ExtensionContext) => {
 		if (draining) return;
 		const e = getEngine();
-		if (e.db.countPending() === 0) return;
+		if (e.pendingCount(ctx.cwd) === 0) return;
 		draining = true;
 		const rw = rewriterFor(e, ctx);
 		const cwd = ctx.cwd;
@@ -415,7 +415,7 @@ export default function realmem(pi: ExtensionAPI) {
 						const rw = rewriterFor(e, ctx);
 						const r = await runWithLoader(ctx, "retrying queued memories", (signal) => e.drainPending(ctx.cwd, rw.rewriter, signal));
 						if (r.error) ctx.ui.notify(`realmem: ${r.error instanceof Error ? r.error.message : String(r.error)}`, "error");
-						else ctx.ui.notify(`realmem: processed ${r.value?.length ?? 0} queued candidate(s); ${e.db.countPending()} left`, "info");
+						else ctx.ui.notify(`realmem: processed ${r.value?.length ?? 0} queued candidate(s); ${e.pendingCount(ctx.cwd)} left`, "info");
 						break;
 					}
 					case "prune-paths":

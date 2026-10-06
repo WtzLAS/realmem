@@ -803,8 +803,9 @@ export class RealmemDB {
 		return Number(r.lastInsertRowid);
 	}
 
+	/** Queued candidates of one project only (`undefined` = candidates queued outside any project). */
 	listPending(projectRoot: string | undefined, limit = 50): Array<{ seq: number; payload: unknown; attempts: number; lastError: string | null; created: number }> {
-		const rows = this.stmt("SELECT seq, payload, attempts, last_error, created FROM pending WHERE project_root IS ? OR project_root IS NULL ORDER BY seq LIMIT ?").all(
+		const rows = this.stmt("SELECT seq, payload, attempts, last_error, created FROM pending WHERE project_root IS ? ORDER BY seq LIMIT ?").all(
 			projectRoot ?? null,
 			limit,
 		) as Row[];
@@ -822,8 +823,9 @@ export class RealmemDB {
 		return out;
 	}
 
-	countPending(): number {
-		return Number((this.stmt("SELECT COUNT(*) AS n FROM pending").get() as { n: number }).n);
+	/** Number of queued candidates of one project (`undefined` = queued outside any project). */
+	countPending(projectRoot: string | undefined): number {
+		return Number((this.stmt("SELECT COUNT(*) AS n FROM pending WHERE project_root IS ?").get(projectRoot ?? null) as { n: number }).n);
 	}
 
 	deletePending(seq: number): void {

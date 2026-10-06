@@ -866,6 +866,11 @@ export class Realmem {
 		});
 	}
 
+	/** Number of queued candidates belonging to the project of `cwd`. */
+	pendingCount(cwd: string): number {
+		return this.db.countPending(this.scopes(cwd).project?.root);
+	}
+
 	/** Retry queued candidates for the current project. */
 	async drainPending(cwd: string, rewriter: Rewriter | undefined, signal?: AbortSignal): Promise<RememberOutcome[]> {
 		if (!this.semif.configured) return [];
@@ -975,7 +980,7 @@ export class Realmem {
 				inject: this.settings.paths.inject,
 			},
 			embeddings: { ...this.db.embeddingStats(fp), fingerprint: fp, sqliteVec: this.db.vecAvailable ? "loaded" : `unavailable (${this.db.vecError})` },
-			pending: this.db.countPending(),
+			pending: this.db.countPending(ctx.project?.root),
 			config: {
 				embedding: this.embedder.configured ? this.settings.embedding.endpoint : null,
 				semif: this.semif.configured ? this.settings.semif.endpoint : null,

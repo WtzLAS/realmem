@@ -101,7 +101,8 @@ segmented identically.
 7. The file is written atomically, then indexed and embedded in the background.
 
 If the judge or embedder is unreachable, the candidate is queued and retried
-automatically (or with `/realmem retry`). If only the embedder is down, the judge
+automatically (or with `/realmem retry`). The queue is per project: a candidate is
+counted, shown and retried only in the project it was queued from. If only the embedder is down, the judge
 compares against BM25 neighbours alone.
 
 If another Pi process holds the write lock for more than 2 minutes, the candidate is
