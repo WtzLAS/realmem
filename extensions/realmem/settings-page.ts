@@ -347,6 +347,66 @@ function fields(): FieldDef[] {
 			values: ["reject", "redact"],
 		},
 		{
+			id: "consolidate.forget",
+			label: "Consolidate: min P(forget)",
+			description: "/realmem consolidate deletes a memory when SemIf judges it obsolete, transient or trivial with at least this probability.",
+			get: (s) => String(s.consolidate.forget),
+			set: (s, v) => {
+				s.consolidate.forget = num(v);
+			},
+			kind: "number",
+			min: 0,
+			max: 1,
+		},
+		{
+			id: "consolidate.minImportance",
+			label: "Consolidate: min importance (0-3)",
+			description: "/realmem consolidate deletes a memory whose expected importance is below this (0 = never on importance alone).",
+			get: (s) => String(s.consolidate.minImportance),
+			set: (s, v) => {
+				s.consolidate.minImportance = num(v);
+			},
+			kind: "number",
+			min: 0,
+			max: 3,
+		},
+		{
+			id: "consolidate.revise",
+			label: "Consolidate: min P(revise)",
+			description: "/realmem consolidate rewrites a memory on its own (Edit/Merge model) when SemIf judges it unclear or verbose with at least this probability.",
+			get: (s) => String(s.consolidate.revise),
+			set: (s, v) => {
+				s.consolidate.revise = num(v);
+			},
+			kind: "number",
+			min: 0,
+			max: 1,
+		},
+		{
+			id: "consolidate.neighbors",
+			label: "Consolidate: neighbours per memory",
+			description: "Each memory is reviewed against up to this many similar memories from the same store.",
+			get: (s) => String(s.consolidate.neighbors),
+			set: (s, v) => {
+				s.consolidate.neighbors = num(v);
+			},
+			kind: "number",
+			min: 1,
+			max: 254,
+			integer: true,
+		},
+		{
+			id: "consolidate.paths",
+			label: "Consolidate: revise paths",
+			description: "Let the Edit/Merge model summarise the repository's file tree and revise the paths of project memories.",
+			get: (s) => (s.consolidate.paths ? "on" : "off"),
+			set: (s, v) => {
+				s.consolidate.paths = v === "on";
+			},
+			kind: "cycle",
+			values: ["on", "off"],
+		},
+		{
 			id: "reset",
 			label: "Reset thresholds to defaults",
 			description: "Restore every threshold and limit (endpoints and keys are kept).",

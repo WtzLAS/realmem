@@ -3,6 +3,8 @@
  * One instance per Pi process; stateless with respect to the working directory
  * (every call passes the cwd so multiple sessions can share it).
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
 import { EmbeddingClient, type HttpTrace, SemIfClient, type SemIfResponse } from "./api.ts";
 import { agentDirFromEnv, embeddingFingerprint, loadSettings, type RealmemPaths, realmemPaths, type Settings, saveSettings, settingsMtime } from "./config.ts";
@@ -24,11 +26,28 @@ import {
 	urgencyTier,
 } from "./judge.ts";
 import { migratePersonalStore, type ProjectInfo, personalStore, type ScopeContext, scopeContext, writeProjectInfo } from "./project.ts";
-import { fallbackRewrite, type RewriteResult, type Rewriter } from "./rewrite.ts";
+import { type Completer, fallbackRewrite, type RewriteRequest, type RewriteResult, type Rewriter } from "./rewrite.ts";
 import { describeSafety, redactSecrets, sanitizeForPrompt, scanAll, scanInjection, stripInvisible } from "./safety.ts";
 import { checkSharedIgnored, describeIgnoreProblem, type IgnoreProblem } from "./gitignore.ts";
 import { MemoryIndex, type RankedHit, type SyncReport } from "./store.ts";
-import { textHash } from "./text.ts";
+import { sha256, textHash } from "./text.ts";
+import {
+	buildPathsPrompt,
+	buildReviewRequest,
+	buildSummaryPrompt,
+	type ConsolidationOp,
+	type ConsolidationPlan,
+	decideReview,
+	PATHS_SYSTEM,
+	type PlannedMemory,
+	parsePathsAnswer,
+	readReview,
+	type ReviewNeighbor,
+	renderTree,
+	SUMMARY_SYSTEM,
+	samePaths,
+	walkFiles,
+} from "./consolidate.ts";
 import {
 	absoluteScopes,
 	clearRepoCache,
@@ -138,6 +157,50 @@ export function toStoreScopes(abs: string[] | undefined, kind: ScopeKind, projec
 }
 
 export class CandidateError extends Error {}
+
+/**
+ * Run a rewrite through the model, falling back to the deterministic rewrite when the
+ * model fails or its answer smuggles in secrets or injected instructions.
+ */
+export async function safeRewrite(req: RewriteRequest, rewriter: Rewriter | undefined, signal?: AbortSignal): Promise<{ result: RewriteResult; fallback?: string }> {
+	if (!rewriter) return { result: fallbackRewrite(req) };
+	let result: RewriteResult;
+	try {
+		result = await rewriter(req);
+	} catch (err) {
+		if (signal?.aborted) throw err;
+		return { result: fallbackRewrite(req), fallback: err instanceof Error ? err.message : String(err) };
+	}
+	const report = scanAll(`${result.caption}\n${result.content}`);
+	const inputs = `${req.target.content}\n${req.candidate?.content ?? ""}`;
+	if (report.injections.length > 0 || (report.secrets.length > 0 && !scanAll(inputs).secrets.length)) {
+		return { result: fallbackRewrite(req), fallback: `rewrite rejected by safety scan: ${describeSafety(report)}` };
+	}
+	return { result };
+}
+
+export interface ConsolidateOptions {
+	cwd: string;
+	/** Only these scopes (default: every store visible from cwd). */
+	scopes?: ScopeKind[];
+	/** Edit/Merge model for merges, supersedes and revisions (fallbacks without it). */
+	rewriter?: Rewriter;
+	/** Edit/Merge model as a plain completer, for the repository summary and path revision. */
+	completer?: Completer;
+	/** Revise project memories' paths (default: settings.consolidate.paths). */
+	paths?: boolean;
+	signal?: AbortSignal;
+	onStep?: (step: string) => void;
+}
+
+export interface ConsolidationResult {
+	updated: number;
+	deleted: number;
+	/** Memories skipped because they changed after the plan was made. */
+	stale: string[];
+}
+
+const SUMMARY_META = "consolidate-summary:";
 
 function now(): string {
 	return new Date().toISOString();
@@ -715,27 +778,8 @@ export class Realmem {
 	private async rewrite(mode: "edit" | "merge", target: MemoryRow, c: Candidate, opts: RememberOptions, trace: Trace): Promise<RewriteResult> {
 		const t0 = Date.now();
 		const req = { mode, target: { caption: target.caption, content: target.content }, candidate: { caption: c.caption, content: c.content }, signal: opts.signal };
-		let result: RewriteResult;
-		if (opts.rewriter) {
-			try {
-				result = await opts.rewriter(req);
-			} catch (err) {
-				if (opts.signal?.aborted) throw err;
-				result = fallbackRewrite(req);
-				trace.rewrite = { ms: Date.now() - t0, model: result.model, fallback: err instanceof Error ? err.message : String(err) };
-				return result;
-			}
-		} else {
-			result = fallbackRewrite(req);
-		}
-		// The rewrite must not smuggle in secrets or injected instructions either.
-		const report = scanAll(`${result.caption}\n${result.content}`);
-		if (report.injections.length > 0 || (report.secrets.length > 0 && !scanAll(`${target.content}\n${c.content}`).secrets.length)) {
-			const fb = fallbackRewrite(req);
-			trace.rewrite = { ms: Date.now() - t0, model: fb.model, fallback: `rewrite rejected by safety scan: ${describeSafety(report)}` };
-			return fb;
-		}
-		trace.rewrite = { ms: Date.now() - t0, model: result.model, usage: result.usage };
+		const { result, fallback } = await safeRewrite(req, opts.rewriter, opts.signal);
+		trace.rewrite = fallback ? { ms: Date.now() - t0, model: result.model, fallback } : { ms: Date.now() - t0, model: result.model, usage: result.usage };
 		return result;
 	}
 
@@ -948,6 +992,284 @@ export class Realmem {
 
 	async deleteMemory(row: MemoryRow): Promise<void> {
 		await this.db.withLock(WRITE_LOCK, async () => this.index.deleteMemory(row));
+	}
+
+	// -------------------------------------------------------------------------
+	// consolidation
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Plan a consolidation without writing anything: SemIf reviews each memory against
+	 * its most similar neighbours in the same store (least used first, so they fold into
+	 * the more used ones) and decides forget / fold (covered, merge, supersede) / revise /
+	 * keep; the Edit/Merge model writes merged and revised texts; then, for project
+	 * memories, it summarises the repository's file tree and revises their paths.
+	 */
+	async planConsolidation(opts: ConsolidateOptions): Promise<ConsolidationPlan> {
+		this.reloadSettingsIfChanged();
+		if (!this.semif.configured) throw new CandidateError("consolidation needs the SemIf judge (set its endpoint in /realmem settings)");
+		const step = opts.onStep ?? (() => {});
+		const ctx = this.scopes(opts.cwd);
+		this.sync(opts.cwd);
+		const stores = ctx.stores.filter((s) => !opts.scopes || opts.scopes.includes(s.kind));
+		const cfg = this.settings.consolidate;
+		const ops: ConsolidationOp[] = [];
+		const warnings: string[] = [];
+		const live = new Map<string, PlannedMemory>();
+		const deleted = new Map<string, MemoryRow>();
+		const rows: MemoryRow[] = [];
+		for (const s of stores) {
+			for (let offset = 0; ; offset += 500) {
+				const batch = this.db.list([s.id], { limit: 500, offset, order: "used" });
+				rows.push(...batch);
+				if (batch.length < 500) break;
+			}
+		}
+		const whole = (k: ScopeKind) => [k === "global" ? "~" : "."];
+		for (const r of rows) live.set(r.id, { row: r, caption: r.caption, content: r.content, paths: r.paths ?? whole(r.kind), usageAdd: 0 });
+		// Least used first: weak memories are folded into strong ones, not the other way round.
+		const order = [...rows].sort((a, b) => a.usedCount - b.usedCount || (a.updated ?? "").localeCompare(b.updated ?? ""));
+		const unionPaths = (into: PlannedMemory, from: PlannedMemory): string[] =>
+			isWholeScope(from.paths) || isWholeScope(into.paths) ? into.paths : normalizePathScopes([...into.paths, ...from.paths], into.row.kind);
+		let reviewed = 0;
+		for (const r of order) {
+			if (opts.signal?.aborted) throw new Error("aborted");
+			const m = live.get(r.id);
+			if (!m) continue;
+			reviewed++;
+			step(`reviewing ${reviewed}/${rows.length}`);
+			// Neighbours from the same store only, so folding never moves facts between scopes.
+			let vectors: Float32Array[] = [];
+			if (this.embedder.configured) {
+				try {
+					vectors = [(await this.index.documentVector(m.caption, m.content, opts.signal)).vec];
+				} catch (err) {
+					if (opts.signal?.aborted) throw err;
+				}
+			}
+			const store = stores.find((s) => s.id === r.store);
+			if (!store) continue;
+			const hits = this.index.hybrid([store], { vectors, texts: [m.caption, m.content], limit: cfg.neighbors + 1 });
+			const neighbors: ReviewNeighbor[] = [];
+			for (const h of hits) {
+				const n = live.get(h.memory.id);
+				if (!n || n.row.id === m.row.id || n.row.store !== m.row.store) continue;
+				neighbors.push({ id: n.row.id, kind: n.row.kind, caption: n.caption, content: n.content, paths: n.paths });
+			}
+			const req = buildReviewRequest(m, neighbors.slice(0, cfg.neighbors), { projectName: ctx.project?.name }, { ...this.settings.candidates, maxNeighbors: cfg.neighbors });
+			const answers: SemIfResponse["answers"] = {};
+			for (const chunk of chunkQuestions(req.questions, this.settings.semif.maxQuestions)) {
+				Object.assign(answers, (await this.semif.evaluate(req.state, chunk, opts.signal)).response.answers);
+			}
+			const included = new Set(req.included.map((n) => n.id));
+			const d = decideReview(readReview(answers), { ...this.settings.thresholds, ...cfg }, (id) => included.has(id) && live.has(id));
+			if (d.action === "keep") continue;
+			if (d.action === "forget") {
+				live.delete(m.row.id);
+				deleted.set(m.row.id, m.row);
+				ops.push({ kind: "forget", id: m.row.id, caption: m.caption, reason: d.reason });
+				continue;
+			}
+			if (d.action === "revise") {
+				step(`revising ${m.row.id.slice(0, 8)}`);
+				const { result, fallback } = await safeRewrite({ mode: "revise", target: { caption: m.caption, content: m.content }, signal: opts.signal }, opts.rewriter, opts.signal);
+				if (fallback) warnings.push(`revise ${m.row.id}: ${fallback}`);
+				if (result.caption === m.caption && result.content === m.content) continue;
+				ops.push({ kind: "revise", id: m.row.id, before: m.caption, caption: result.caption, reason: d.reason, model: result.model });
+				m.caption = result.caption;
+				m.content = result.content;
+				continue;
+			}
+			// Fold m into the neighbour d.target (covered, merge or supersede).
+			const t = live.get(d.target) as PlannedMemory;
+			let caption = t.caption;
+			let content = t.content;
+			let model: string | undefined;
+			if (d.action !== "covered") {
+				step(`${d.action === "merge" ? "merging" : "superseding"} ${m.row.id.slice(0, 8)}`);
+				// Supersede: the more recently updated memory states the current truth.
+				const mNewer = (m.row.updated ?? "") >= (t.row.updated ?? "");
+				const pair =
+					d.action === "merge"
+						? { mode: "merge" as const, target: t, candidate: m }
+						: { mode: "edit" as const, target: mNewer ? t : m, candidate: mNewer ? m : t };
+				const { result, fallback } = await safeRewrite(
+					{
+						mode: pair.mode,
+						target: { caption: pair.target.caption, content: pair.target.content },
+						candidate: { caption: pair.candidate.caption, content: pair.candidate.content },
+						signal: opts.signal,
+					},
+					opts.rewriter,
+					opts.signal,
+				);
+				if (fallback) warnings.push(`${d.action} ${m.row.id} → ${t.row.id}: ${fallback}`);
+				caption = result.caption;
+				content = result.content;
+				model = result.model;
+			}
+			ops.push({ kind: "fold", how: d.action, from: m.row.id, into: t.row.id, fromCaption: m.caption, caption, reason: d.reason, model });
+			t.caption = caption;
+			t.content = content;
+			t.paths = unionPaths(t, m);
+			t.usageAdd += m.row.usedCount + m.usageAdd;
+			live.delete(m.row.id);
+			deleted.set(m.row.id, m.row);
+		}
+
+		let repoSummary: string | undefined;
+		const project = ctx.project;
+		const projectMems = [...live.values()].filter((m) => m.row.kind !== "global");
+		if ((opts.paths ?? cfg.paths) && project && projectMems.length > 0) {
+			if (!opts.completer) warnings.push("paths not revised: no Edit/Merge model is available");
+			else {
+				try {
+					repoSummary = await this.revisePaths(project.root, project.name, project.isGit, projectMems, opts, ops, warnings);
+				} catch (err) {
+					if (opts.signal?.aborted) throw err;
+					warnings.push(`paths not revised: ${err instanceof Error ? err.message : String(err)}`);
+				}
+			}
+		}
+
+		const changed = [...live.values()].filter(
+			(m) => m.caption !== m.row.caption || m.content !== m.row.content || !samePaths(m.paths, m.row.paths ?? whole(m.row.kind)) || m.usageAdd > 0,
+		);
+		return { stores: stores.map((s) => s.id), total: rows.length, reviewed, ops, changed, deleted: [...deleted.values()], repoSummary, warnings };
+	}
+
+	/** Summarise the repository (cached per file tree) and let the model revise the memories' paths. */
+	private async revisePaths(
+		root: string,
+		name: string,
+		isGit: boolean,
+		mems: PlannedMemory[],
+		opts: ConsolidateOptions,
+		ops: ConsolidationOp[],
+		warnings: string[],
+	): Promise<string> {
+		const complete = opts.completer as Completer;
+		const cfg = this.settings.consolidate;
+		const step = opts.onStep ?? (() => {});
+		this.resetRepoCache();
+		const git = repoFiles(root, isGit);
+		const repo = git.files ? git : { ...git, files: walkFiles(root) };
+		const tree = renderTree(repo.files ?? [], cfg.treeLines);
+		const key = `${SUMMARY_META}${root}`;
+		const treeHash = sha256(tree);
+		let summary: string | undefined;
+		try {
+			const cached = JSON.parse(this.db.getMeta(key) ?? "null") as { tree?: string; summary?: string } | null;
+			if (cached?.tree === treeHash && cached.summary) summary = cached.summary;
+		} catch {
+			// recompute
+		}
+		if (!summary) {
+			step("summarising the repository");
+			let readme: string | undefined;
+			for (const f of ["README.md", "README", "readme.md", "README.rst"]) {
+				try {
+					readme = readFileSync(join(root, f), "utf8");
+					break;
+				} catch {
+					// next
+				}
+			}
+			const r = await complete({ system: SUMMARY_SYSTEM, prompt: buildSummaryPrompt(name, tree, readme), maxTokens: 2048, signal: opts.signal });
+			summary = r.text.trim();
+			if (!summary) throw new Error("the model returned an empty repository summary");
+			this.db.setMeta(key, JSON.stringify({ tree: treeHash, summary, at: now() }));
+		}
+		const exists = (scope: string) => scopeExists(root, scope, repo);
+		for (let i = 0; i < mems.length; i += cfg.pathBatch) {
+			if (opts.signal?.aborted) throw new Error("aborted");
+			const batch = mems.slice(i, i + cfg.pathBatch);
+			step(`revising paths ${Math.min(i + batch.length, mems.length)}/${mems.length}`);
+			const prompt = buildPathsPrompt(
+				summary,
+				tree,
+				batch.map((m) => ({ id: m.row.id, caption: m.caption, content: m.content, paths: m.paths, missing: m.paths.filter((p) => !exists(p)) })),
+			);
+			let text: string;
+			try {
+				text = (await complete({ system: PATHS_SYSTEM, prompt, maxTokens: 4096, cache: true, signal: opts.signal })).text;
+			} catch (err) {
+				if (opts.signal?.aborted) throw err;
+				warnings.push(`paths of ${batch.length} memories not revised: ${err instanceof Error ? err.message : String(err)}`);
+				continue;
+			}
+			const answer = parsePathsAnswer(text, batch.map((m) => m.row.id), exists);
+			if (answer.size === 0) warnings.push(`paths of ${batch.length} memories not revised: the model gave no usable answer`);
+			for (const m of batch) {
+				const next = answer.get(m.row.id);
+				if (!next || samePaths(next, m.paths)) continue;
+				ops.push({ kind: "paths", id: m.row.id, caption: m.caption, before: m.paths, after: next });
+				m.paths = next;
+			}
+		}
+		return summary;
+	}
+
+	/** Write a consolidation plan. Memories changed since the plan was made are left alone. */
+	async applyConsolidation(cwd: string, plan: ConsolidationPlan): Promise<ConsolidationResult> {
+		const ctx = this.scopes(cwd);
+		const out = await this.db.withLock(WRITE_LOCK, async () => {
+			this.index.sync(ctx.stores);
+			const stale: string[] = [];
+			const fresh = (r: MemoryRow) => {
+				const f = this.db.getById(r.id, [r.store]);
+				return f && f.hash === r.hash && JSON.stringify(f.paths ?? null) === JSON.stringify(r.paths ?? null) ? f : undefined;
+			};
+			const whole = (k: ScopeKind) => [k === "global" ? "~" : "."];
+			let updated = 0;
+			let removed = 0;
+			const notWritten = new Set<string>();
+			for (const m of plan.changed) {
+				const f = fresh(m.row);
+				const store = this.storeById(ctx, m.row.store);
+				if (!f || !store) {
+					stale.push(m.row.id);
+					notWritten.add(m.row.id);
+					continue;
+				}
+				const textChanged = m.caption !== f.caption || m.content !== f.content || !samePaths(m.paths, f.paths ?? whole(f.kind));
+				if (textChanged) {
+					this.index.writeMemory(
+						store,
+						{ id: f.id, caption: m.caption, content: m.content, paths: normalizePathScopes(m.paths, f.kind), created: f.created ?? undefined, updated: now() },
+						f.file,
+					);
+					updated++;
+				}
+				if (m.usageAdd > 0) this.db.bumpUsage([f.id], "reinforce", m.usageAdd);
+			}
+			// A memory folded into another is only deleted when the memory that absorbed it was written.
+			const into = new Map<string, string>();
+			for (const op of plan.ops) if (op.kind === "fold") into.set(op.from, op.into);
+			const finalTarget = (id: string) => {
+				let cur = id;
+				for (let i = 0; i < 1000 && into.has(cur); i++) cur = into.get(cur) as string;
+				return cur;
+			};
+			for (const r of plan.deleted) {
+				const f = fresh(r);
+				if (!f || (into.has(r.id) && notWritten.has(finalTarget(r.id)))) {
+					stale.push(r.id);
+					continue;
+				}
+				this.index.deleteMemory(f);
+				removed++;
+			}
+			return { updated, deleted: removed, stale };
+		});
+		void this.embedInBackground();
+		void this.refreshUrgencyInBackground(cwd);
+		try {
+			this.checkPaths(cwd, true);
+		} catch {
+			// git unavailable
+		}
+		return out;
 	}
 
 	// -------------------------------------------------------------------------

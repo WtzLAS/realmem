@@ -94,6 +94,23 @@ export interface Settings {
 	safety: {
 		secretAction: SecretAction;
 	};
+	/** /realmem consolidate. */
+	consolidate: {
+		/** Minimum P(forget) (obsolete, transient, trivial) to delete a memory. */
+		forget: number;
+		/** Delete a memory whose expected importance (0..3) is below this. 0 = never on importance alone. */
+		minImportance: number;
+		/** Minimum P(revise) to rewrite a memory on its own with the Edit/Merge model. */
+		revise: number;
+		/** Similar memories (same store) each memory is reviewed against (1..254). */
+		neighbors: number;
+		/** Revise project memories' paths from a model summary of the repository's file tree. */
+		paths: boolean;
+		/** Memories per path-revision request. */
+		pathBatch: number;
+		/** Max lines of the file tree sent to the model. */
+		treeLines: number;
+	};
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -152,6 +169,15 @@ export const DEFAULT_SETTINGS: Settings = {
 	},
 	safety: {
 		secretAction: "reject",
+	},
+	consolidate: {
+		forget: 0.7,
+		minImportance: 0.5,
+		revise: 0.7,
+		neighbors: 12,
+		paths: true,
+		pathBatch: 20,
+		treeLines: 400,
 	},
 };
 
@@ -225,6 +251,12 @@ export function normalizeSettings(raw: unknown): Settings {
 	s.recall.maxResults = Math.round(clamp(s.recall.maxResults, 1, 500));
 	s.list.pageSize = Math.round(clamp(s.list.pageSize, 1, 500));
 	s.prompt.topCaptions = Math.round(clamp(s.prompt.topCaptions, 0, 200));
+	s.consolidate.forget = clamp(s.consolidate.forget, 0, 1);
+	s.consolidate.revise = clamp(s.consolidate.revise, 0, 1);
+	s.consolidate.minImportance = clamp(s.consolidate.minImportance, 0, 3);
+	s.consolidate.neighbors = Math.round(clamp(s.consolidate.neighbors, 1, 254));
+	s.consolidate.pathBatch = Math.round(clamp(s.consolidate.pathBatch, 1, 200));
+	s.consolidate.treeLines = Math.round(clamp(s.consolidate.treeLines, 20, 5000));
 	if (s.safety.secretAction !== "redact") s.safety.secretAction = "reject";
 	if (!["imported", "always", "never"].includes(s.prompt.stripContextFiles)) s.prompt.stripContextFiles = "imported";
 	return s;

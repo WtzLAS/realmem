@@ -229,11 +229,46 @@ Moving a memory between stores (manage page) re-expresses its paths.
 | `add` | remember a fact yourself |
 | `import` | the agent splits AGENTS.md / CLAUDE.md into facts |
 | `prune-paths` | drop paths that no longer exist from memories (after a confirm listing the changes); a memory whose paths are all gone is deleted |
+| `consolidate [global] [shared] [personal] [--no-paths]` | shrink and clean the memory base (see below); shows the plan and writes nothing until you press `w` |
 | `fix-gitignore` | check whether `.pi/realmem` is ignored by git and append the verified fix |
 | `status`, `embed`, `reindex`, `retry` | maintenance |
 
 API keys may be given as `$VAR` or `env:VAR` so they are not stored in `config.json`
 (which is mode 0600).
+
+### Consolidation
+
+`/realmem consolidate` makes the memory base smaller and cleaner in two passes, then
+shows the plan (`s` shows the repository summary) and writes it only after `w`:
+
+1. **SemIf review.** Every memory is reviewed, least used first, against its most
+   similar memories in the **same store** (`consolidate.neighbors`, default 12), so facts
+   never move between scopes. Questions: `covered_by`, `conflict_with`, `merge_with`
+   (ids plus `none`), `forget` (obsolete, transient, speculative or trivial),
+   `importance` and `revise` (unclear or verbose). The decision, in this order:
+   - P(forget) ≥ `consolidate.forget` (0.7), or importance < `consolidate.minImportance`
+     (0.5; 0 disables it) → **forget**;
+   - a confident `covered_by` → the memory is dropped into its neighbour (**covered**);
+   - a confident `conflict_with` → **supersede**: the Edit/Merge model rewrites the older
+     memory with the newer one's facts, and the pair becomes one memory;
+   - a confident `merge_with` → **merge** through the Edit/Merge model;
+   - P(revise) ≥ `consolidate.revise` (0.7) → the Edit/Merge model rewrites it alone
+     (same information, clearer and shorter).
+
+   The surviving memory keeps its id, gets the union of both path scopes and the folded
+   memory's `used_count`. Rewrites pass the same safety scan as Edit/Merge.
+2. **Path revision** (project memories; `consolidate.paths`, or `--no-paths` to skip).
+   The Edit/Merge model summarises the repository from its file tree (`git ls-files`, or
+   a bounded walk outside git; collapsed to `consolidate.treeLines` lines) and the README.
+   The summary is cached in the database per tree. Then, in batches, it gets the summary,
+   the tree and each memory with its current paths (missing ones are marked) and answers
+   `{"<id>": ["path", ...]}`: drop paths that are gone or unrelated, add files or
+   directories the fact applies to, `["."]` for project-wide facts. Paths that do not
+   exist in the tree or leave the project are discarded.
+
+A memory that was edited between planning and writing is left alone (reported as
+skipped), and a folded memory is only deleted when the memory that absorbed it was
+written.
 
 ## Install
 

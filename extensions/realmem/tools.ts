@@ -7,7 +7,7 @@ import { Type } from "typebox";
 import { CandidateError, type Realmem } from "../../src/engine.ts";
 import { SCOPE_LABEL } from "../../src/files.ts";
 import { formatList, formatOutcomeForModel, formatRecall, formatStatus, memoryEnvelope, SCOPE_ARG } from "../../src/format.ts";
-import { createRewriter, type Rewriter, resolveModel } from "../../src/rewrite.ts";
+import { type Completer, createCompleter, createRewriter, type Rewriter, resolveModel } from "../../src/rewrite.ts";
 
 export interface ToolHost {
 	engine(ctx: ExtensionContext): Realmem;
@@ -21,12 +21,16 @@ export interface ToolHost {
 
 const SCOPE_VALUES = ["global", "project-shared", "project-personal"] as const;
 
-export function rewriterFor(engine: Realmem, ctx: ExtensionContext): { rewriter?: Rewriter; model?: string; error?: string } {
+export function rewriterFor(engine: Realmem, ctx: ExtensionContext): { rewriter?: Rewriter; completer?: Completer; model?: string; error?: string } {
 	const model = resolveModel(engine.settings.rewriteModel, ctx.modelRegistry, ctx.model);
 	if (!model) {
 		return { error: engine.settings.rewriteModel ? `rewrite model ${engine.settings.rewriteModel} not found` : "no model selected for rewrites" };
 	}
-	return { rewriter: createRewriter(ctx.modelRegistry, model), model: `${model.provider}/${model.id}` };
+	return {
+		rewriter: createRewriter(ctx.modelRegistry, model),
+		completer: createCompleter(ctx.modelRegistry, model),
+		model: `${model.provider}/${model.id}`,
+	};
 }
 
 function text(t: string) {
