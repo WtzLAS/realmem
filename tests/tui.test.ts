@@ -3,7 +3,7 @@
  * component, renders it (checking every line fits the width) and feeds scripted keys.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ import { Realmem } from "../src/engine.ts";
 import { openDebug } from "../extensions/realmem/debug-page.ts";
 import { openManage } from "../extensions/realmem/manage-page.ts";
 import { openSettings } from "../extensions/realmem/settings-page.ts";
+import { runConsolidate } from "../extensions/realmem/consolidate-page.ts";
 
 const KEY = { enter: "\r", esc: "\x1b", backspace: "\x7f", down: "\x1b[B", up: "\x1b[A" };
 const WIDTH = 72;
@@ -325,5 +326,47 @@ test("settings page: edit a number through the submenu, save, clear the embeddin
 		assert.ok(existsSync(join(base, "realmem.sqlite")));
 	} finally {
 		e.close();
+	}
+});
+
+test("consolidate page: asks about each step with its detail; y writes it, n skips, q stops", async () => {
+	const p2 = mkdtempSync(join(tmpdir(), "realmem-tuicons-"));
+	const e = new Realmem(base);
+	try {
+		const dir = join(p2, ".pi", "realmem");
+		mkdirSync(dir, { recursive: true });
+		for (const n of [1, 2, 3]) {
+			const id = `01900000-0000-7000-8000-0000000001${String(n).padStart(2, "0")}`;
+			writeFileSync(join(dir, `${id}.md`), `---\nid: ${id}\ncaption: "Note ${n}"\n---\n\nBody text of note ${n}.\n`);
+		}
+		const shown: string[] = [];
+		const { ctx } = fakeCtx(
+			p2,
+			[
+				async (c, frame) => {
+					// The mock judge says P(forget)=0.95 for every memory: three forget questions.
+					for (const key of ["n", "y", "q"]) {
+						let text = "";
+						for (let i = 0; i < 200 && !(text = frame().join("\n")).includes("Forget?"); i++) await new Promise((r) => setTimeout(r, 10));
+						shown.push(text);
+						c.handleInput?.(key);
+					}
+				},
+			],
+			{},
+		);
+		const r = await runConsolidate(ctx, e, { cwd: p2, paths: false });
+		assert.ok(r.value, String(r.error));
+		assert.equal(shown.length, 3, "one screen per question; q on the third stops the run");
+		assert.ok(shown[0].includes("Forget?") && shown[0].includes("Body text of note") && shown[0].includes("y accept"), shown[0]);
+		assert.match(shown[0], /review 1\/\d+/);
+		assert.equal(r.value?.skipped, 1);
+		assert.equal(r.value?.accepted, 1);
+		assert.ok(r.value?.stopped);
+		assert.equal(r.written.deleted, 1);
+		assert.equal(readdirSync(dir).filter((f) => f.endsWith(".md")).length, 2);
+	} finally {
+		e.close();
+		rmSync(p2, { recursive: true, force: true });
 	}
 });

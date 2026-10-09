@@ -9,9 +9,9 @@ import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { formatPlan, planSummary } from "../../src/consolidate.ts";
+import { runConsolidate } from "./consolidate-page.ts";
 import { Realmem } from "../../src/engine.ts";
-import { SCOPE_LABEL, type ScopeKind } from "../../src/files.ts";
+import type { ScopeKind } from "../../src/files.ts";
 import { formatPathNotes, formatStatus } from "../../src/format.ts";
 import { describeIgnoreProblem, SHARED_REL } from "../../src/gitignore.ts";
 import { displayPath, touchedPaths } from "../../src/paths.ts";
@@ -456,7 +456,8 @@ export default function realmem(pi: ExtensionAPI) {
 
 /**
  * /realmem consolidate [global|shared|personal ...] [--no-paths]: plan with SemIf and the
- * Edit/Merge model, show the plan, and write it after confirmation.
+ * Edit/Merge model, asking about every forget / fold / revise / path change; an accepted
+ * step is written at once.
  */
 async function consolidate(ctx: ExtensionCommandContext, e: Realmem, args: string): Promise<void> {
 	const words = args.toLowerCase().split(/\s+/).filter(Boolean);
@@ -468,61 +469,27 @@ async function consolidate(ctx: ExtensionCommandContext, e: Realmem, args: strin
 		return;
 	}
 	const rw = rewriterFor(e, ctx);
-	if (ctx.hasUI) {
-		const ok = await ctx.ui.confirm(
-			"Consolidate memories?",
-			[
-				`SemIf reviews ${scopes.length ? scopes.map((k) => SCOPE_LABEL[k]).join(", ") : "every visible"} memory against its most similar ones in the same store, to forget obsolete or trivial ones, fold duplicates and related ones together, and revise unclear ones.`,
-				words.includes("--no-paths") ? "" : `Then ${rw.model ?? "the Edit/Merge model"} summarises the repository's file tree and revises the paths of project memories.`,
-				rw.error ? `Warning: ${rw.error}; merges fall back to appending and paths are not revised.` : "",
-				"",
-				"Nothing is written until you confirm the resulting plan.",
-			]
-				.filter((l, i, a) => l || (i > 0 && a[i - 1]))
-				.join("\n"),
-		);
-		if (!ok) return;
+	if (rw.error) ctx.ui.notify(`realmem: ${rw.error}; merges fall back to appending and paths are not revised.`, "warning");
+	const r = await runConsolidate(ctx, e, {
+		cwd: ctx.cwd,
+		scopes: scopes.length ? scopes : undefined,
+		rewriter: rw.rewriter,
+		completer: rw.completer,
+		paths: words.includes("--no-paths") ? false : undefined,
+	});
+	const w = r.written;
+	const wrote = `updated ${w.updated}, deleted ${w.deleted}${w.stale.length ? `; skipped ${w.stale.length} changed meanwhile` : ""}`;
+	if (r.cancelled) {
+		ctx.ui.notify(`realmem: consolidation cancelled; ${wrote}`, "info");
+		return;
 	}
-	const r = await runWithLoader(ctx, "consolidating", (signal, setMessage) =>
-		e.planConsolidation({
-			cwd: ctx.cwd,
-			scopes: scopes.length ? scopes : undefined,
-			rewriter: rw.rewriter,
-			completer: rw.completer,
-			paths: words.includes("--no-paths") ? false : undefined,
-			signal,
-			onStep: setMessage,
-		}),
-	);
-	if (r.cancelled) return;
 	if (r.error || !r.value) {
-		ctx.ui.notify(`realmem: ${r.error instanceof Error ? r.error.message : String(r.error)}`, "error");
+		ctx.ui.notify(`realmem: ${r.error instanceof Error ? r.error.message : String(r.error)}${w.updated + w.deleted ? ` (${wrote})` : ""}`, "error");
 		return;
 	}
-	const plan = r.value;
-	const lines = formatPlan(plan);
-	if (plan.ops.length === 0) {
-		ctx.ui.notify(`realmem: nothing to consolidate (${planSummary(plan)})${lines.length ? `\n${lines.join("\n")}` : ""}`, "info");
-		return;
-	}
-	if (ctx.hasUI) {
-		const text = [planSummary(plan), "", ...lines];
-		if (ctx.mode === "tui") {
-			const pick = await showText(ctx, "realmem consolidate · plan", () => text, [
-				{ id: "apply" as const, key: "w", label: "write" },
-				{ id: "summary" as const, key: "s", label: "repo summary" },
-			]);
-			if (pick === "summary" && plan.repoSummary) {
-				const again = await showText(ctx, "realmem consolidate · repository summary", () => (plan.repoSummary ?? "").split("\n"), [{ id: "apply" as const, key: "w", label: "write" }]);
-				if (again !== "apply") return;
-			} else if (pick !== "apply") return;
-		} else if (!(await ctx.ui.confirm(`Apply? ${planSummary(plan)}`, lines.join("\n")))) return;
-	}
-	const done = await e.applyConsolidation(ctx.cwd, plan);
-	ctx.ui.notify(
-		`realmem: consolidated: updated ${done.updated}, deleted ${done.deleted}${done.stale.length ? `; skipped ${done.stale.length} changed meanwhile` : ""}`,
-		"info",
-	);
+	const v = r.value;
+	const head = v.proposed === 0 ? `nothing to consolidate (reviewed ${v.reviewed}/${v.total})` : `consolidated: ${wrote}; accepted ${v.accepted}, skipped ${v.skipped}${v.stopped ? ", stopped early" : ""}`;
+	ctx.ui.notify(`realmem: ${head}${v.warnings.length ? `\n${v.warnings.map((x) => `warning: ${x}`).join("\n")}` : ""}`, v.warnings.length ? "warning" : "info");
 }
 
 /** Show the gitignore problem for the shared store and, after confirmation, append the verified fix. */

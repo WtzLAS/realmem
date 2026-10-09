@@ -4,13 +4,13 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { normalizeSettings, saveSettings } from "../src/config.ts";
-import { buildReviewRequest, decideReview, formatPlan, parsePathsAnswer, readReview, renderTree, SUMMARY_SYSTEM } from "../src/consolidate.ts";
+import { buildReviewRequest, type ConsolidationProposal, decideReview, formatPlan, formatProposal, parsePathsAnswer, readReview, renderTree, SUMMARY_SYSTEM } from "../src/consolidate.ts";
 import { Realmem } from "../src/engine.ts";
 import { parseId } from "../src/ids.ts";
 import { clearProjectCache } from "../src/project.ts";
@@ -206,4 +206,70 @@ test("consolidate unit: review request, decision order, path answers, tree rende
 	assert.match(tree, /README\.md/);
 	assert.match(tree, /\(30 files\)/);
 	assert.ok(!tree.includes("realmem"));
+});
+
+test("interactive consolidate asks about every step and writes accepted ones at once", async () => {
+	clearProjectCache();
+	const e = new Realmem(base);
+	try {
+		const dir = join(proj, ".pi", "realmem");
+		rmSync(dir, { recursive: true, force: true });
+		mkdirSync(dir, { recursive: true });
+		const keepId = mem(dir, 31, "Run tests with npm test", "Run `npm test`; it uses node --test.");
+		const dupId = mem(dir, 32, "DUP tests run via npm test", "npm test runs the tests.");
+		const oldId = mem(dir, 33, "OLD refactor in progress", "Currently refactoring the parser.");
+		const verboseId = mem(dir, 34, "VERBOSE build", "Build build build: npm run build builds.");
+		const pathId = mem(dir, 35, "Package manifest notes", "package.json has no scripts besides test.", ["gone/old.json"]);
+		e.sync(proj);
+		e.db.setUsage(keepId, 9);
+
+		const seen: ConsolidationProposal[] = [];
+		const written: number[] = [];
+		const res = await e.consolidate({
+			cwd: proj,
+			rewriter: async (req) =>
+				req.mode === "revise"
+					? { caption: "Build with npm run build", content: "Build with `npm run build`.", model: "fake" }
+					: { caption: req.target.caption, content: req.target.content, model: "fake" },
+			completer: async (req) =>
+				req.system === SUMMARY_SYSTEM ? { text: "src/ holds the code.", model: "fake" } : { text: JSON.stringify({ [pathId]: ["package.json"] }), model: "fake" },
+			approve: async (p) => {
+				seen.push(p);
+				// The step is not written before it is approved.
+				if (p.op.kind === "forget") assert.ok(existsSync(join(dir, `${p.op.id}.md`)) || e.db.getById(p.op.id));
+				return p.op.kind === "forget" ? "skip" : "accept";
+			},
+			onWritten: (d) => written.push(d.updated + d.deleted),
+		});
+		const kinds = seen.map((p) => p.op.kind);
+		assert.ok(kinds.includes("forget") && kinds.includes("fold") && kinds.includes("revise") && kinds.includes("paths"), kinds.join());
+		const fold = seen.find((p) => p.op.kind === "fold") as ConsolidationProposal;
+		assert.equal(fold.before.length, 2, "a fold shows both memories");
+		assert.ok(fold.before[0].content.includes("npm test runs the tests"));
+		const rev = seen.find((p) => p.op.kind === "revise") as ConsolidationProposal;
+		assert.equal(rev.after?.caption, "Build with npm run build");
+		assert.ok(formatProposal(rev).some((l) => l.includes("Build build build")) && formatProposal(rev).some((l) => l.includes("`npm run build`")));
+		const paths = seen.find((p) => p.op.kind === "paths") as ConsolidationProposal;
+		assert.deepEqual(paths.after?.paths, ["package.json"]);
+		assert.ok(seen.every((p) => /^(review|paths) \d+\/\d+$/.test(p.progress)), seen.map((p) => p.progress).join());
+
+		assert.equal(res.skipped, 1);
+		assert.equal(res.accepted, seen.length - 1);
+		assert.ok(written.length >= 3 && written.every((n, i) => i === 0 || n >= written[i - 1]), "each accepted step is written on its own");
+		assert.ok(e.db.getById(oldId), "skipped forget is kept");
+		assert.ok(!e.db.getById(dupId), "accepted fold deleted the duplicate");
+		assert.equal(e.db.getById(keepId)?.usedCount, 9 + 0, "usage carries over (duplicate had none)");
+		assert.equal(e.db.getById(verboseId)?.caption, "Build with npm run build");
+		assert.deepEqual(e.db.getById(pathId)?.paths, ["package.json"]);
+
+		// Stop ends the run at the first question and writes nothing.
+		let asked = 0;
+		const stopped = await e.consolidate({ cwd: proj, paths: false, approve: async () => (asked++, "stop") });
+		assert.equal(asked, 1);
+		assert.ok(stopped.stopped);
+		assert.equal(stopped.updated + stopped.deleted, 0);
+		assert.ok(e.db.getById(oldId));
+	} finally {
+		e.close();
+	}
 });
