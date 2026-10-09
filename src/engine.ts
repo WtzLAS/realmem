@@ -37,12 +37,9 @@ import {
 	buildSummaryPrompt,
 	type ConsolidationOp,
 	type ConsolidationPlan,
-	type ConsolidationProposal,
-	type MemoryView,
 	decideReview,
 	PATHS_SYSTEM,
 	type PlannedMemory,
-	type ProposalAnswer,
 	parsePathsAnswer,
 	readReview,
 	type ReviewNeighbor,
@@ -196,29 +193,11 @@ export interface ConsolidateOptions {
 	onStep?: (step: string) => void;
 }
 
-export interface InteractiveConsolidateOptions extends ConsolidateOptions {
-	/** Asked before each step; an accepted step is written at once, "stop" ends the run. */
-	approve: (p: ConsolidationProposal) => Promise<ProposalAnswer>;
-	/** Called after each write with the running totals. */
-	onWritten?: (done: ConsolidationResult) => void;
-}
-
 export interface ConsolidationResult {
 	updated: number;
 	deleted: number;
 	/** Memories skipped because they changed after the plan was made. */
 	stale: string[];
-}
-
-export interface InteractiveConsolidationResult extends ConsolidationResult {
-	/** Steps proposed, accepted and skipped. */
-	proposed: number;
-	accepted: number;
-	skipped: number;
-	stopped: boolean;
-	reviewed: number;
-	total: number;
-	warnings: string[];
 }
 
 const SUMMARY_META = "consolidate-summary:";
@@ -1027,30 +1006,6 @@ export class Realmem {
 	 * memories, it summarises the repository's file tree and revises their paths.
 	 */
 	async planConsolidation(opts: ConsolidateOptions): Promise<ConsolidationPlan> {
-		return (await this.runConsolidation(opts)).plan;
-	}
-
-	/**
-	 * Interactive consolidation: the same review as planConsolidation, but every step is
-	 * shown to opts.approve with its full before/after text and, when accepted, written at
-	 * once, so later steps see the written state. Steps written before a stop, a cancel or
-	 * an error stay written.
-	 */
-	async consolidate(opts: InteractiveConsolidateOptions): Promise<InteractiveConsolidationResult> {
-		const tally: Omit<InteractiveConsolidationResult, "reviewed" | "total" | "warnings"> = { proposed: 0, accepted: 0, skipped: 0, stopped: false, updated: 0, deleted: 0, stale: [] };
-		try {
-			const { plan } = await this.runConsolidation(opts, opts, tally);
-			return { ...tally, reviewed: plan.reviewed, total: plan.total, warnings: plan.warnings };
-		} finally {
-			if (tally.updated + tally.deleted > 0) this.afterConsolidation(opts.cwd);
-		}
-	}
-
-	private async runConsolidation(
-		opts: ConsolidateOptions,
-		interactive?: InteractiveConsolidateOptions,
-		tally: Omit<InteractiveConsolidationResult, "reviewed" | "total" | "warnings"> = { proposed: 0, accepted: 0, skipped: 0, stopped: false, updated: 0, deleted: 0, stale: [] },
-	): Promise<{ plan: ConsolidationPlan }> {
 		this.reloadSettingsIfChanged();
 		if (!this.semif.configured) throw new CandidateError("consolidation needs the SemIf judge (set its endpoint in /realmem settings)");
 		const step = opts.onStep ?? (() => {});
@@ -1071,48 +1026,7 @@ export class Realmem {
 			}
 		}
 		const whole = (k: ScopeKind) => [k === "global" ? "~" : "."];
-		const fromRow = (r: MemoryRow): PlannedMemory => ({ row: r, caption: r.caption, content: r.content, paths: r.paths ?? whole(r.kind), usageAdd: 0 });
-		const view = (m: PlannedMemory): MemoryView => ({ id: m.row.id, caption: m.caption, content: m.content, paths: m.paths });
-		for (const r of rows) live.set(r.id, fromRow(r));
-
-		/** Ask about a step before it changes anything; false = skipped or stopped. */
-		const ask = async (op: ConsolidationOp, before: PlannedMemory[], after: MemoryView | undefined, progress: string): Promise<boolean> => {
-			if (!interactive) return true;
-			tally.proposed++;
-			const answer = await interactive.approve({ op, before: before.map(view), after, progress });
-			if (answer === "accept") tally.accepted++;
-			else if (answer === "stop") tally.stopped = true;
-			else tally.skipped++;
-			return answer === "accept";
-		};
-		/** Record a step (already applied to the simulated state); interactive runs write it at once. */
-		const commit = async (op: ConsolidationOp, changed: PlannedMemory[], removed: MemoryRow[]): Promise<void> => {
-			ops.push(op);
-			for (const r of removed) {
-				live.delete(r.id);
-				deleted.set(r.id, r);
-			}
-			if (!interactive) return;
-			const r = await this.db.withLock(WRITE_LOCK, async () => {
-				this.index.sync(ctx.stores);
-				return this.writeConsolidation(ctx, { ops: [op], changed, deleted: removed });
-			});
-			tally.updated += r.updated;
-			tally.deleted += r.deleted;
-			tally.stale.push(...r.stale);
-			// Later steps compare against what is on disk now (a stale memory keeps its edited text).
-			for (const m of [...changed.map((c) => c.row), ...removed]) {
-				const f = this.db.getById(m.id, [m.store]);
-				if (!f) {
-					live.delete(m.id);
-					continue;
-				}
-				live.set(m.id, fromRow(f));
-				deleted.delete(m.id);
-			}
-			interactive.onWritten?.({ updated: tally.updated, deleted: tally.deleted, stale: [...tally.stale] });
-		};
-
+		for (const r of rows) live.set(r.id, { row: r, caption: r.caption, content: r.content, paths: r.paths ?? whole(r.kind), usageAdd: 0 });
 		// Least used first: weak memories are folded into strong ones, not the other way round.
 		const order = [...rows].sort((a, b) => a.usedCount - b.usedCount || (a.updated ?? "").localeCompare(b.updated ?? ""));
 		const unionPaths = (into: PlannedMemory, from: PlannedMemory): string[] =>
@@ -1120,11 +1034,9 @@ export class Realmem {
 		let reviewed = 0;
 		for (const r of order) {
 			if (opts.signal?.aborted) throw new Error("aborted");
-			if (tally.stopped) break;
 			const m = live.get(r.id);
 			if (!m) continue;
 			reviewed++;
-			const progress = `review ${reviewed}/${rows.length}`;
 			step(`reviewing ${reviewed}/${rows.length}`);
 			// Neighbours from the same store only, so folding never moves facts between scopes.
 			let vectors: Float32Array[] = [];
@@ -1153,8 +1065,9 @@ export class Realmem {
 			const d = decideReview(readReview(answers), { ...this.settings.thresholds, ...cfg }, (id) => included.has(id) && live.has(id));
 			if (d.action === "keep") continue;
 			if (d.action === "forget") {
-				const op: ConsolidationOp = { kind: "forget", id: m.row.id, caption: m.caption, reason: d.reason };
-				if (await ask(op, [m], undefined, progress)) await commit(op, [], [m.row]);
+				live.delete(m.row.id);
+				deleted.set(m.row.id, m.row);
+				ops.push({ kind: "forget", id: m.row.id, caption: m.caption, reason: d.reason });
 				continue;
 			}
 			if (d.action === "revise") {
@@ -1162,11 +1075,9 @@ export class Realmem {
 				const { result, fallback } = await safeRewrite({ mode: "revise", target: { caption: m.caption, content: m.content }, signal: opts.signal }, opts.rewriter, opts.signal);
 				if (fallback) warnings.push(`revise ${m.row.id}: ${fallback}`);
 				if (result.caption === m.caption && result.content === m.content) continue;
-				const op: ConsolidationOp = { kind: "revise", id: m.row.id, before: m.caption, caption: result.caption, reason: d.reason, model: result.model };
-				if (!(await ask(op, [m], { ...view(m), caption: result.caption, content: result.content }, progress))) continue;
+				ops.push({ kind: "revise", id: m.row.id, before: m.caption, caption: result.caption, reason: d.reason, model: result.model });
 				m.caption = result.caption;
 				m.content = result.content;
-				await commit(op, [m], []);
 				continue;
 			}
 			// Fold m into the neighbour d.target (covered, merge or supersede).
@@ -1197,29 +1108,23 @@ export class Realmem {
 				content = result.content;
 				model = result.model;
 			}
-			const paths = unionPaths(t, m);
-			const op: ConsolidationOp = { kind: "fold", how: d.action, from: m.row.id, into: t.row.id, fromCaption: m.caption, caption, reason: d.reason, model };
-			if (!(await ask(op, [m, t], { id: t.row.id, caption, content, paths }, progress))) continue;
+			ops.push({ kind: "fold", how: d.action, from: m.row.id, into: t.row.id, fromCaption: m.caption, caption, reason: d.reason, model });
 			t.caption = caption;
 			t.content = content;
-			t.paths = paths;
+			t.paths = unionPaths(t, m);
 			t.usageAdd += m.row.usedCount + m.usageAdd;
-			await commit(op, [t], [m.row]);
+			live.delete(m.row.id);
+			deleted.set(m.row.id, m.row);
 		}
 
 		let repoSummary: string | undefined;
 		const project = ctx.project;
 		const projectMems = [...live.values()].filter((m) => m.row.kind !== "global");
-		if ((opts.paths ?? cfg.paths) && project && projectMems.length > 0 && !tally.stopped) {
+		if ((opts.paths ?? cfg.paths) && project && projectMems.length > 0) {
 			if (!opts.completer) warnings.push("paths not revised: no Edit/Merge model is available");
 			else {
 				try {
-					repoSummary = await this.revisePaths(project.root, project.name, project.isGit, projectMems, opts, warnings, async (op, m, after, progress) => {
-						if (!(await ask(op, [m], { ...view(m), paths: after }, progress))) return !tally.stopped;
-						m.paths = after;
-						await commit(op, [m], []);
-						return true;
-					});
+					repoSummary = await this.revisePaths(project.root, project.name, project.isGit, projectMems, opts, ops, warnings);
 				} catch (err) {
 					if (opts.signal?.aborted) throw err;
 					warnings.push(`paths not revised: ${err instanceof Error ? err.message : String(err)}`);
@@ -1230,7 +1135,7 @@ export class Realmem {
 		const changed = [...live.values()].filter(
 			(m) => m.caption !== m.row.caption || m.content !== m.row.content || !samePaths(m.paths, m.row.paths ?? whole(m.row.kind)) || m.usageAdd > 0,
 		);
-		return { plan: { stores: stores.map((s) => s.id), total: rows.length, reviewed, ops, changed, deleted: [...deleted.values()], repoSummary, warnings } };
+		return { stores: stores.map((s) => s.id), total: rows.length, reviewed, ops, changed, deleted: [...deleted.values()], repoSummary, warnings };
 	}
 
 	/** Summarise the repository (cached per file tree) and let the model revise the memories' paths. */
@@ -1240,9 +1145,8 @@ export class Realmem {
 		isGit: boolean,
 		mems: PlannedMemory[],
 		opts: ConsolidateOptions,
+		ops: ConsolidationOp[],
 		warnings: string[],
-		/** Propose one path change; returns false to stop. */
-		propose: (op: ConsolidationOp, m: PlannedMemory, after: string[], progress: string) => Promise<boolean>,
 	): Promise<string> {
 		const complete = opts.completer as Completer;
 		const cfg = this.settings.consolidate;
@@ -1299,8 +1203,8 @@ export class Realmem {
 			for (const m of batch) {
 				const next = answer.get(m.row.id);
 				if (!next || samePaths(next, m.paths)) continue;
-				const op: ConsolidationOp = { kind: "paths", id: m.row.id, caption: m.caption, before: m.paths, after: next };
-				if (!(await propose(op, m, next, `paths ${mems.indexOf(m) + 1}/${mems.length}`))) return summary;
+				ops.push({ kind: "paths", id: m.row.id, caption: m.caption, before: m.paths, after: next });
+				m.paths = next;
 			}
 		}
 		return summary;
@@ -1311,64 +1215,53 @@ export class Realmem {
 		const ctx = this.scopes(cwd);
 		const out = await this.db.withLock(WRITE_LOCK, async () => {
 			this.index.sync(ctx.stores);
-			return this.writeConsolidation(ctx, plan);
+			const stale: string[] = [];
+			const fresh = (r: MemoryRow) => {
+				const f = this.db.getById(r.id, [r.store]);
+				return f && f.hash === r.hash && JSON.stringify(f.paths ?? null) === JSON.stringify(r.paths ?? null) ? f : undefined;
+			};
+			const whole = (k: ScopeKind) => [k === "global" ? "~" : "."];
+			let updated = 0;
+			let removed = 0;
+			const notWritten = new Set<string>();
+			for (const m of plan.changed) {
+				const f = fresh(m.row);
+				const store = this.storeById(ctx, m.row.store);
+				if (!f || !store) {
+					stale.push(m.row.id);
+					notWritten.add(m.row.id);
+					continue;
+				}
+				const textChanged = m.caption !== f.caption || m.content !== f.content || !samePaths(m.paths, f.paths ?? whole(f.kind));
+				if (textChanged) {
+					this.index.writeMemory(
+						store,
+						{ id: f.id, caption: m.caption, content: m.content, paths: normalizePathScopes(m.paths, f.kind), created: f.created ?? undefined, updated: now() },
+						f.file,
+					);
+					updated++;
+				}
+				if (m.usageAdd > 0) this.db.bumpUsage([f.id], "reinforce", m.usageAdd);
+			}
+			// A memory folded into another is only deleted when the memory that absorbed it was written.
+			const into = new Map<string, string>();
+			for (const op of plan.ops) if (op.kind === "fold") into.set(op.from, op.into);
+			const finalTarget = (id: string) => {
+				let cur = id;
+				for (let i = 0; i < 1000 && into.has(cur); i++) cur = into.get(cur) as string;
+				return cur;
+			};
+			for (const r of plan.deleted) {
+				const f = fresh(r);
+				if (!f || (into.has(r.id) && notWritten.has(finalTarget(r.id)))) {
+					stale.push(r.id);
+					continue;
+				}
+				this.index.deleteMemory(f);
+				removed++;
+			}
+			return { updated, deleted: removed, stale };
 		});
-		this.afterConsolidation(cwd);
-		return out;
-	}
-
-	/** Write (part of) a plan; call under WRITE_LOCK after syncing the index. */
-	private writeConsolidation(ctx: ScopeContext, plan: Pick<ConsolidationPlan, "ops" | "changed" | "deleted">): ConsolidationResult {
-		const stale: string[] = [];
-		const fresh = (r: MemoryRow) => {
-			const f = this.db.getById(r.id, [r.store]);
-			return f && f.hash === r.hash && JSON.stringify(f.paths ?? null) === JSON.stringify(r.paths ?? null) ? f : undefined;
-		};
-		const whole = (k: ScopeKind) => [k === "global" ? "~" : "."];
-		let updated = 0;
-		let removed = 0;
-		const notWritten = new Set<string>();
-		for (const m of plan.changed) {
-			const f = fresh(m.row);
-			const store = this.storeById(ctx, m.row.store);
-			if (!f || !store) {
-				stale.push(m.row.id);
-				notWritten.add(m.row.id);
-				continue;
-			}
-			const textChanged = m.caption !== f.caption || m.content !== f.content || !samePaths(m.paths, f.paths ?? whole(f.kind));
-			if (textChanged) {
-				this.index.writeMemory(
-					store,
-					{ id: f.id, caption: m.caption, content: m.content, paths: normalizePathScopes(m.paths, f.kind), created: f.created ?? undefined, updated: now() },
-					f.file,
-				);
-				updated++;
-			}
-			if (m.usageAdd > 0) this.db.bumpUsage([f.id], "reinforce", m.usageAdd);
-		}
-		// A memory folded into another is only deleted when the memory that absorbed it was written.
-		const into = new Map<string, string>();
-		for (const op of plan.ops) if (op.kind === "fold") into.set(op.from, op.into);
-		const finalTarget = (id: string) => {
-			let cur = id;
-			for (let i = 0; i < 1000 && into.has(cur); i++) cur = into.get(cur) as string;
-			return cur;
-		};
-		for (const r of plan.deleted) {
-			const f = fresh(r);
-			if (!f || (into.has(r.id) && notWritten.has(finalTarget(r.id)))) {
-				stale.push(r.id);
-				continue;
-			}
-			this.index.deleteMemory(f);
-			removed++;
-		}
-		return { updated, deleted: removed, stale };
-	}
-
-	/** Background work after consolidation writes: embeddings, path urgency, path checks. */
-	private afterConsolidation(cwd: string): void {
 		void this.embedInBackground();
 		void this.refreshUrgencyInBackground(cwd);
 		try {
@@ -1376,6 +1269,7 @@ export class Realmem {
 		} catch {
 			// git unavailable
 		}
+		return out;
 	}
 
 	// -------------------------------------------------------------------------

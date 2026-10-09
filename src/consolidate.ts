@@ -60,65 +60,6 @@ export interface ConsolidationPlan {
 	warnings: string[];
 }
 
-/** A memory's text and paths, as shown in a proposal. */
-export interface MemoryView {
-	id: string;
-	caption: string;
-	content: string;
-	paths: string[];
-}
-
-/** One step of an interactive consolidation, shown to the user before it is written. */
-export interface ConsolidationProposal {
-	op: ConsolidationOp;
-	/** The memories as they are now: the reviewed memory first, then the fold target. */
-	before: MemoryView[];
-	/** The memory that results (absent when the step only deletes). */
-	after?: MemoryView;
-	/** Progress: "review 3/42" or "paths 2/10". */
-	progress: string;
-}
-
-export type ProposalAnswer = "accept" | "skip" | "stop";
-
-/** Human-readable lines for one proposal (one line per paragraph; the view wraps them). */
-export function formatProposal(p: ConsolidationProposal): string[] {
-	const show = (m: MemoryView, label: string): string[] => [
-		`${label} ${m.id.slice(0, 8)}: ${m.caption}`,
-		...m.content.split("\n").map((l) => `  ${l}`),
-		`  paths: ${m.paths.join(", ")}`,
-	];
-	const op = p.op;
-	const out: string[] = [];
-	switch (op.kind) {
-		case "forget":
-			out.push(`Forget? ${op.reason}`, "", ...show(p.before[0], "delete"));
-			break;
-		case "fold": {
-			const what = op.how === "covered" ? "Delete as a duplicate (its usage carries over)" : op.how === "merge" ? "Merge into the other memory" : "Reconcile with the other memory";
-			out.push(`${what}? ${op.reason}`, "", ...show(p.before[0], "fold"), "", ...show(p.before[1], "into"));
-			if (op.how !== "covered" && p.after) out.push("", ...show(p.after, op.model ? `result (${op.model})` : "result"));
-			break;
-		}
-		case "revise":
-			out.push(`Revise? ${op.reason}`, "", ...show(p.before[0], "before"));
-			if (p.after) out.push("", ...show(p.after, op.model ? `after (${op.model})` : "after"));
-			break;
-		case "paths":
-			out.push(
-				`Change the paths?`,
-				"",
-				`${op.id.slice(0, 8)}: ${op.caption}`,
-				`  before: ${op.before.join(", ")}`,
-				`  after:  ${op.after.join(", ")}`,
-				"",
-				...(p.before[0]?.content.split("\n").map((l) => `  ${l}`) ?? []),
-			);
-			break;
-	}
-	return out;
-}
-
 // ---------------------------------------------------------------------------
 // SemIf review
 // ---------------------------------------------------------------------------

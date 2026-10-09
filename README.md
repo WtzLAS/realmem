@@ -229,7 +229,7 @@ Moving a memory between stores (manage page) re-expresses its paths.
 | `add` | remember a fact yourself |
 | `import` | the agent splits AGENTS.md / CLAUDE.md into facts |
 | `prune-paths` | drop paths that no longer exist from memories (after a confirm listing the changes); a memory whose paths are all gone is deleted |
-| `consolidate [global] [shared] [personal] [--no-paths]` | shrink and clean the memory base (see below); asks about every forget / merge / revise / path change and writes each accepted one at once |
+| `consolidate [global] [shared] [personal] [--no-paths]` | shrink and clean the memory base (see below); fully automatic, writes the result and reports what changed |
 | `fix-gitignore` | check whether `.pi/realmem` is ignored by git and append the verified fix |
 | `status`, `embed`, `reindex`, `retry` | maintenance |
 
@@ -238,12 +238,9 @@ API keys may be given as `$VAR` or `env:VAR` so they are not stored in `config.j
 
 ### Consolidation
 
-`/realmem consolidate` makes the memory base smaller and cleaner in two passes. Each
-proposed step is shown with its full detail before anything changes: the memory to
-forget, both memories of a fold and the merged result, the text before and after a
-revision, the paths before and after. `y` accepts and writes the step at once, `n`
-skips it, `q`/`esc` stops the run (accepted steps stay written). Later steps see what
-was written.
+`/realmem consolidate` makes the memory base smaller and cleaner in two passes and writes
+the result straight away, with no review or confirmation (`esc` cancels while it runs;
+nothing is written before both passes finish). It then reports every change it made:
 
 1. **SemIf review.** Every memory is reviewed, least used first, against its most
    similar memories in the **same store** (`consolidate.neighbors`, default 12), so facts
@@ -270,8 +267,8 @@ was written.
    directories the fact applies to, `["."]` for project-wide facts. Paths that do not
    exist in the tree or leave the project are discarded.
 
-A memory that was edited by hand while the step was proposed is left alone (reported
-as skipped), and a folded memory is only deleted when the memory that absorbed it was
+A memory that was edited while consolidation ran is left alone (reported as
+skipped), and a folded memory is only deleted when the memory that absorbed it was
 written.
 
 ## Install
